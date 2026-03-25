@@ -1,6 +1,9 @@
 """Template Manager — loads, caches, and validates PPTX designer templates."""
+from __future__ import annotations
+
 import os
 from pathlib import Path
+from typing import Optional
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
