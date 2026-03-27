@@ -8,7 +8,10 @@ Rendering modes:
 Each section_type has a dedicated render function.
 """
 import io
+import os
 import re
+import shutil
+import tempfile
 from typing import Optional
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
@@ -35,8 +38,8 @@ def _clone_template_slide(pres: Presentation, template_pptx_path: str):
     Clone the first slide from a template PPTX into the target presentation.
     Returns the new slide, or None if cloning fails.
     
-    This copies all shape XML (preserving formatting, colors, gradients)
-    from the template into a new blank slide in the target presentation.
+    Copies shapes, background, AND image/media relationships so embedded
+    pictures and backgrounds survive the clone.
     """
     try:
         tpl = Presentation(template_pptx_path)
@@ -44,42 +47,84 @@ def _clone_template_slide(pres: Presentation, template_pptx_path: str):
             return None
         
         src_slide = tpl.slides[0]
+        src_part = src_slide.part
         
         # Add blank slide to target
         blank_layout = pres.slide_layouts[6]  # Blank layout
         new_slide = pres.slides.add_slide(blank_layout)
+        dest_part = new_slide.part
         
-        # Remove default shapes from blank slide
+        # ── Step 1: Copy image/media relationships ──
+        rId_map = {}
+        for rId, rel in list(src_part.rels.items()):
+            try:
+                if 'image' in rel.reltype or 'media' in rel.reltype:
+                    new_rId = dest_part.relate_to(rel.target_part, rel.reltype)
+                    rId_map[rId] = new_rId
+            except Exception:
+                pass
+        
+        # Also copy images from source slide layout and master into target
+        try:
+            for ancestor in [src_slide.slide_layout, src_slide.slide_layout.slide_master]:
+                if ancestor is None:
+                    continue
+                for rId, rel in list(ancestor.part.rels.items()):
+                    try:
+                        if 'image' in rel.reltype:
+                            target_ancestor = new_slide.slide_layout if ancestor == src_slide.slide_layout else new_slide.slide_layout.slide_master
+                            if target_ancestor:
+                                target_ancestor.part.relate_to(rel.target_part, rel.reltype)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        
+        # ── Step 2: Remove default shapes from blank slide ──
         for shape in list(new_slide.shapes):
             sp = shape._element
             sp.getparent().remove(sp)
         
-        # Copy each shape from template to new slide
+        # ── Step 3: Copy each shape, updating rId references ──
         for shape in src_slide.shapes:
             el = copy_module.deepcopy(shape._element)
+            # Update any rId references in the copied element
+            if rId_map:
+                for sub_el in el.iter():
+                    for attr_name in list(sub_el.attrib.keys()):
+                        val = sub_el.attrib[attr_name]
+                        if val in rId_map:
+                            sub_el.attrib[attr_name] = rId_map[val]
             new_slide.shapes._spTree.append(el)
         
-        # Copy background
+        # ── Step 4: Copy background ──
         try:
-            src_bg = src_slide.background
-            if src_bg and src_bg._element is not None:
-                new_bg_el = copy_module.deepcopy(src_bg._element)
-                cSld = new_slide._element.find(
-                    '{http://schemas.openxmlformats.org/presentationml/2006/main}cSld'
-                )
-                if cSld is not None:
-                    existing_bg = cSld.find(
-                        '{http://schemas.openxmlformats.org/presentationml/2006/main}bg'
-                    )
+            PML_NS = '{http://schemas.openxmlformats.org/presentationml/2006/main}'
+            src_cSld = src_slide._element.find(f'{PML_NS}cSld')
+            dest_cSld = new_slide._element.find(f'{PML_NS}cSld')
+            if src_cSld is not None and dest_cSld is not None:
+                src_bg = src_cSld.find(f'{PML_NS}bg')
+                if src_bg is not None:
+                    new_bg = copy_module.deepcopy(src_bg)
+                    # Update rId references in background
+                    if rId_map:
+                        for sub_el in new_bg.iter():
+                            for attr_name in list(sub_el.attrib.keys()):
+                                val = sub_el.attrib[attr_name]
+                                if val in rId_map:
+                                    sub_el.attrib[attr_name] = rId_map[val]
+                    existing_bg = dest_cSld.find(f'{PML_NS}bg')
                     if existing_bg is not None:
-                        cSld.remove(existing_bg)
-                    cSld.insert(0, new_bg_el)
+                        dest_cSld.remove(existing_bg)
+                    dest_cSld.insert(0, new_bg)
         except Exception:
             pass
         
         return new_slide
     except Exception as e:
         print(f"Template clone failed: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -658,21 +703,55 @@ def render_pivotal_table(pres, d: dict, P: dict, meta: dict):
                 _add_textbox(sl, Inches(x), Inches(2.2), Inches(2.9), Inches(0.3),
                              f"vs {vs}", font_size=9, font_color=P["dim"], alignment=PP_ALIGN.CENTER)
 
-        # KM Curve as chart image
-        drug_mo = _parse_months(eff.get("mpfs_drug", ""))
-        ctrl_mo = _parse_months(eff.get("mpfs_control", ""))
-        if drug_mo and ctrl_mo and drug_mo > 0 and ctrl_mo > 0:
-            theme_key = _theme_key_from_palette(P)
+        # KM Curve — choose best endpoint: prefer specific data per trial
+        theme_key = _theme_key_from_palette(P)
+        km_rendered = False
+        
+        # Try PFS first
+        pfs_drug = _parse_months(eff.get("mpfs_drug", ""))
+        pfs_ctrl = _parse_months(eff.get("mpfs_control", ""))
+        if pfs_drug and pfs_ctrl and pfs_drug > 0 and pfs_ctrl > 0:
             km_png = chart_renderer.render_km_curve(
                 drug_name=meta.get("drug", "Drug"),
-                drug_mpfs_months=drug_mo,
-                control_mpfs_months=ctrl_mo,
+                drug_median=pfs_drug,
+                control_median=pfs_ctrl,
+                endpoint="PFS",
                 n_total=_str(tr.get("n_total", "N/A")),
+                hr=_str(eff.get("hr_pfs", "")),
+                p_value=_str(eff.get("p_value_pfs", eff.get("p_value", ""))),
                 theme=theme_key,
             )
             if km_png:
                 img_stream = io.BytesIO(km_png)
                 sl.shapes.add_picture(img_stream, Inches(6.5), Inches(3.2), Inches(6.0), Inches(3.5))
+                km_rendered = True
+        
+        # Also try OS — if different from PFS, add as second chart below safety
+        os_drug = _parse_months(eff.get("mos_drug", ""))
+        os_ctrl = _parse_months(eff.get("mos_control", ""))
+        if os_drug and os_ctrl and os_drug > 0 and os_ctrl > 0:
+            # Only add if OS data is actually different from PFS
+            if not km_rendered or abs(os_drug - (pfs_drug or 0)) > 1.0:
+                os_png = chart_renderer.render_km_curve(
+                    drug_name=meta.get("drug", "Drug"),
+                    drug_median=os_drug,
+                    control_median=os_ctrl,
+                    endpoint="OS",
+                    n_total=_str(tr.get("n_total", "N/A")),
+                    hr=_str(eff.get("hr_os", "")),
+                    p_value=_str(eff.get("p_value_os", "")),
+                    theme=theme_key,
+                )
+                if os_png:
+                    img_stream = io.BytesIO(os_png)
+                    if km_rendered:
+                        # Put OS on a separate slide
+                        sl2 = _new_slide(pres, P)
+                        _slide_header(sl2, f"{_str(tr.get('name',''))} — Overall Survival", P, _str(tr.get("design", "")))
+                        sl2.shapes.add_picture(img_stream, Inches(1.5), Inches(1.5), Inches(10.0), Inches(5.0))
+                        _slide_footer(sl2, P, [tr.get("source", "")])
+                    else:
+                        sl.shapes.add_picture(img_stream, Inches(6.5), Inches(3.2), Inches(6.0), Inches(3.5))
 
         # Safety text
         saf = tr.get("safety", {})
@@ -692,9 +771,10 @@ def render_pivotal_table(pres, d: dict, P: dict, meta: dict):
 
 def render_competitor_table(pres, d: dict, P: dict, meta: dict):
     rows = d.get("rows", [])
-    # Bar chart image
+    theme_key = _theme_key_from_palette(P)
+    
+    # mPFS Bar chart
     if len(rows) >= 3:
-        theme_key = _theme_key_from_palette(P)
         chart_png = chart_renderer.render_mpfs_bar_chart(
             rows=rows, focus_drug=meta.get("drug", ""), theme=theme_key,
         )
@@ -702,6 +782,18 @@ def render_competitor_table(pres, d: dict, P: dict, meta: dict):
             sl = _new_slide(pres, P)
             _slide_header(sl, "Competitive Landscape — mPFS Comparison", P, f"{meta.get('country','Global')} {meta.get('year','')}")
             img_stream = io.BytesIO(chart_png)
+            sl.shapes.add_picture(img_stream, Inches(0.3), Inches(1.0), Inches(12.7), Inches(5.8))
+            _slide_footer(sl, P, _extract_refs(d))
+
+    # ORR Bar chart (NEW)
+    if len(rows) >= 3:
+        orr_png = chart_renderer.render_orr_bar_chart(
+            rows=rows, focus_drug=meta.get("drug", ""), theme=theme_key,
+        )
+        if orr_png:
+            sl = _new_slide(pres, P)
+            _slide_header(sl, "Competitive Landscape — ORR Comparison", P, f"{meta.get('country','Global')} {meta.get('year','')}")
+            img_stream = io.BytesIO(orr_png)
             sl.shapes.add_picture(img_stream, Inches(0.3), Inches(1.0), Inches(12.7), Inches(5.8))
             _slide_footer(sl, P, _extract_refs(d))
 
@@ -1167,37 +1259,125 @@ def _theme_key_from_palette(P: dict) -> str:
 # ══════════════════════════════════════════════════════════
 # MAIN RENDER FUNCTION
 # ══════════════════════════════════════════════════════════
+
+# Template slide index → section type mapping (matches the 20-slide templates)
+TEMPLATE_SLIDE_MAP = {
+    0: "_title",
+    1: "executive_summary",
+    2: "disease_intro",
+    3: "_divider",
+    4: "pivotal_table",
+    5: "prevalence_kpi",
+    6: "differentiators",
+    7: "areas_interest",
+    8: "iep",
+    9: "guidelines",
+    10: "moa",
+    11: "imperatives",
+    12: "treatment_algo",
+    13: "tactics",
+    14: "narrative",
+    15: "unmet_needs",
+    16: "timeline",
+    17: "market_access",
+    18: "swot",
+    19: "competitor_table",
+}
+# Reverse: section_type → slide index
+SECTION_TO_SLIDE = {}
+for idx, stype in TEMPLATE_SLIDE_MAP.items():
+    SECTION_TO_SLIDE[stype] = idx
+# Aliases
+SECTION_TO_SLIDE["strategic_imperatives"] = 11
+SECTION_TO_SLIDE["tactical_plan"] = 13
+
+
+def _duplicate_slide_internal(pres, slide_index):
+    """Duplicate a slide within the same presentation. Safe — no cross-pres issues."""
+    src = pres.slides[slide_index]
+    layout = src.slide_layout
+    new_slide = pres.slides.add_slide(layout)
+    
+    # Remove auto-generated placeholder shapes
+    for shape in list(new_slide.shapes):
+        shape._element.getparent().remove(shape._element)
+    
+    # Deep copy all shapes from source (same pres → rIds are valid)
+    for shape in src.shapes:
+        new_slide.shapes._spTree.append(copy_module.deepcopy(shape._element))
+    
+    # Copy explicit background if set on source
+    PML = '{http://schemas.openxmlformats.org/presentationml/2006/main}'
+    src_bg = src._element.find(f'{PML}cSld/{PML}bg')
+    if src_bg is not None:
+        dest_cSld = new_slide._element.find(f'{PML}cSld')
+        dest_bg = dest_cSld.find(f'{PML}bg')
+        if dest_bg is not None:
+            dest_cSld.remove(dest_bg)
+        dest_cSld.insert(0, copy_module.deepcopy(src_bg))
+    
+    return len(pres.slides) - 1  # Index of new slide
+
+
+def _reorder_and_keep(pres, keep_indices):
+    """Keep only slides at given indices (in that order), delete the rest."""
+    sldIdLst = pres.slides._sldIdLst
+    all_items = list(sldIdLst)
+    
+    # Clear list
+    for item in list(sldIdLst):
+        sldIdLst.remove(item)
+    
+    # Re-add in desired order
+    for idx in keep_indices:
+        sldIdLst.append(all_items[idx])
+    
+    # Drop relationships for removed slides
+    keep_set = set(keep_indices)
+    for idx, item in enumerate(all_items):
+        if idx not in keep_set:
+            rId = item.get(
+                '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id', ''
+            )
+            if rId:
+                try:
+                    pres.part.drop_rel(rId)
+                except Exception:
+                    pass
+
+
 def render_pptx(meta: dict, sections: list[dict], template_id: str = "dark") -> bytes:
     """
     Render a complete premium PPTX from MAP data.
 
+    Two modes:
+      1. IN-PLACE: Opens the full 20-slide designer template, fills data, removes
+         unused slides, adds extras. No cross-presentation cloning — PowerPoint
+         opens without repair warnings.
+      2. PROGRAMMATIC: Fallback when no template available. Builds slides from scratch.
+
     Args:
         meta: dict with drug, indication, year, country, etc.
         sections: list of {id, label, icon, data} dicts from Step 4 review
-        template_id: theme key (dark, light, gray, pharma, premium)
+        template_id: theme key (medai_normal, medai_gold, medai_aquarell, etc.)
 
     Returns:
         bytes of the generated .pptx file
     """
-    # Map template_id to internal theme
+    # ── Map template_id to internal theme ──
     theme_map = {
         "medai_dark": "normal", "medai_normal": "normal", "normal": "normal",
         "medai_gold": "gold", "gold": "gold",
         "medai_aquarell": "aquarell", "aquarell": "aquarell",
-        # Legacy mappings (fallback to normal)
-        "dark": "normal", "light": "normal", "gray": "normal", 
+        "dark": "normal", "light": "normal", "gray": "normal",
         "pharma": "normal", "premium": "gold",
         "medai_light": "normal", "consulting": "normal",
         "pharma_blue": "normal", "black_gold": "gold",
     }
-    theme = theme_map.get(template_id, "dark")
+    theme = theme_map.get(template_id, "normal")
     P = PALETTES.get(theme, PALETTES["dark"])
 
-    pres = Presentation()
-    pres.slide_width = SLIDE_W
-    pres.slide_height = SLIDE_H
-
-    # Order: exec summary first, summary last, everything else in between
+    # ── Order sections ──
     exec_item = next((s for s in sections if s.get("id") == "executive_summary"), None)
     summ_item = next((s for s in sections if s.get("id") == "summary"), None)
     others = [s for s in sections if s.get("id") not in ("executive_summary", "summary")]
@@ -1207,105 +1387,262 @@ def render_pptx(meta: dict, sections: list[dict], template_id: str = "dark") -> 
     for item in ordered:
         all_refs.extend(_extract_refs(item.get("data", {})))
 
-    # ── TITLE SLIDE ──
-    # Try template first
-    title_tpl_path = template_manager.get_template_path(theme, "_title")
-    if title_tpl_path:
-        title_sl = _clone_template_slide(pres, str(title_tpl_path))
-        if title_sl:
-            _fill_title(title_sl, meta, len(ordered), len(set(all_refs)))
-            print(f"  ✓ Title slide from template")
-        else:
-            title_sl = None
-    else:
-        title_sl = None
+    # ── Try IN-PLACE mode with full template ──
+    full_tpl_path = template_manager.get_full_template_path(theme)
+    if full_tpl_path:
+        print(f"  ✓ IN-PLACE MODE: {theme}/_full.pptx")
+        return _render_inplace(full_tpl_path, meta, ordered, all_refs, P, theme)
     
-    if title_sl is None:
-        # Fallback: programmatic title
-        title_sl = _new_slide(pres, P)
-        _add_rect(title_sl, Inches(0), Inches(0), SLIDE_W, SLIDE_H, P["bg"])
-        _add_rect(title_sl, MX, Inches(2.2), Inches(4), Inches(0.06), P["teal"])
-        _add_textbox(title_sl, MX, Inches(2.5), MW, Inches(1.2),
-                     meta.get("drug", "Medical Affairs Plan"),
-                     font_size=36, font_color=P["white"], bold=True)
-        scope = meta.get("country") or meta.get("region") or "Global"
-        _add_textbox(title_sl, MX, Inches(3.6), MW, Inches(0.6),
-                     f"{scope} Medical Affairs Plan — {meta.get('year', '')}",
-                     font_size=16, font_color=P["muted"])
-        _add_textbox(title_sl, MX, Inches(4.3), MW, Inches(0.4),
-                     meta.get("indication", ""), font_size=12, font_color=P["teal"])
-        _add_textbox(title_sl, MX, Inches(5.2), MW, Inches(0.4),
-                     f"{len(ordered)} Sections · {len(set(all_refs))} References · {meta.get('model', 'Claude')}",
-                     font_size=10, font_color=P["dim"], font_name="DM Mono")
-        _add_textbox(title_sl, MX, Inches(6.8), MW, Inches(0.3),
-                     "MedAI Suite Premium · AI-Verified by ELISE",
-                     font_size=8, font_color=P["dim"], font_name="DM Mono")
+    # ── Fallback: PROGRAMMATIC mode ──
+    print(f"  → PROGRAMMATIC MODE (no _full.pptx for {theme})")
+    return _render_programmatic(meta, ordered, all_refs, P, theme)
 
-    # ── CONTENT SLIDES ──
+
+def _render_inplace(tpl_path, meta, ordered, all_refs, P, theme):
+    """
+    IN-PLACE rendering: Open full 20-slide template, fill data, reorder, clean up.
+    No cross-presentation cloning. PowerPoint opens without warnings.
+    """
+    # Load template as copy
+    tmp = tempfile.NamedTemporaryFile(suffix=".pptx", delete=False)
+    tmp.close()
+    shutil.copy2(str(tpl_path), tmp.name)
+    pres = Presentation(tmp.name)
+    os.unlink(tmp.name)
+    pres.slide_width = SLIDE_W
+    pres.slide_height = SLIDE_H
+    
+    DIVIDER_IDX = 3  # Template slide index for divider
+    n_original = len(pres.slides)  # Should be 20
+    
+    # ── Phase 1: Fill title slide (always slide 0) ──
+    _fill_title(pres.slides[0], meta, len(ordered), len(set(all_refs)))
+    print(f"  ✓ Title slide filled")
+    
+    # ── Phase 2: Fill template slides that match selected sections ──
+    used_template_indices = {0}  # Title is always used
+    
+    for item in ordered:
+        d = item.get("data", {})
+        stype = d.get("section_type", item.get("id", ""))
+        tpl_idx = SECTION_TO_SLIDE.get(stype)
+        
+        if tpl_idx is not None and tpl_idx < n_original:
+            used_template_indices.add(tpl_idx)
+            slide = pres.slides[tpl_idx]
+            
+            # Try template filler first
+            filler = TEMPLATE_FILLERS.get(stype)
+            if filler:
+                try:
+                    filler(slide, d, meta)
+                    print(f"  ✓ {stype}: template filled (slide {tpl_idx})")
+                except Exception as e:
+                    print(f"  ⚠ {stype}: template fill error ({e})")
+            else:
+                # No specific filler — just set header
+                _set_text(_find_shape(slide, "header_title"),
+                          item.get("label", stype.replace("_", " ").title()))
+                print(f"  ~ {stype}: header-only (slide {tpl_idx})")
+    
+    # ── Phase 3: Create dividers (duplicate within same pres) ──
+    # Each section needs a divider before it. We duplicate the template divider.
+    divider_indices = {}  # section_type → new slide index
+    
+    for sec_num, item in enumerate(ordered, 1):
+        d = item.get("data", {})
+        stype = d.get("section_type", item.get("id", ""))
+        label = item.get("label", stype.replace("_", " ").title())
+        
+        new_idx = _duplicate_slide_internal(pres, DIVIDER_IDX)
+        _fill_divider(pres.slides[new_idx], sec_num, label)
+        divider_indices[stype] = new_idx
+    
+    print(f"  ✓ {len(divider_indices)} dividers created")
+    
+    # ── Phase 4: Add extra programmatic slides (charts, overflow tables) ──
+    # These are sections that produce ADDITIONAL slides beyond the template slide.
+    # They append to the presentation and we track their indices.
+    extra_indices = {}  # section_type → [list of extra slide indices]
+    
+    for item in ordered:
+        d = item.get("data", {})
+        stype = d.get("section_type", item.get("id", ""))
+        extras = []
+        theme_key = _theme_key_from_palette(P)
+        
+        try:
+            if stype == "treatment_algo":
+                # Overflow table pages (the template has 1 slide, but we may need more)
+                lines = d.get("lines", [])
+                all_regs = []
+                for ln in lines:
+                    for reg in ln.get("regimens", []):
+                        if isinstance(reg, dict):
+                            all_regs.append(reg)
+                        elif isinstance(reg, str):
+                            all_regs.append({"name": reg, "line": ln.get("line","")})
+                if len(all_regs) > 8:
+                    # Need overflow pages — render programmatically
+                    overflow_start = len(pres.slides)
+                    render_treatment_algo(pres, d, P, meta)
+                    # The programmatic renderer added slides starting at overflow_start
+                    # We'll include ALL of them (they replace the template slide)
+                    extras = list(range(overflow_start, len(pres.slides)))
+            
+            elif stype == "pivotal_table":
+                # KM curves + possibly multiple trial slides
+                overflow_start = len(pres.slides)
+                render_pivotal_table(pres, d, P, meta)
+                extras = list(range(overflow_start, len(pres.slides)))
+                # For pivotal, programmatic slides ARE the content (not overflow)
+                # So we DON'T use the template slide
+                used_template_indices.discard(SECTION_TO_SLIDE.get(stype, -1))
+            
+            elif stype == "competitor_table":
+                # mPFS chart + ORR chart + table pages
+                overflow_start = len(pres.slides)
+                render_competitor_table(pres, d, P, meta)
+                extras = list(range(overflow_start, len(pres.slides)))
+                used_template_indices.discard(SECTION_TO_SLIDE.get(stype, -1))
+            
+            elif stype == "subgroup_analysis":
+                overflow_start = len(pres.slides)
+                render_subgroup_analysis(pres, d, P, meta)
+                extras = list(range(overflow_start, len(pres.slides)))
+            
+            elif stype in ("iep", "guidelines", "tactical_plan", "tactics"):
+                # These often produce multiple table pages
+                tpl_idx = SECTION_TO_SLIDE.get(stype)
+                renderer = SECTION_RENDERERS.get(stype)
+                if renderer and tpl_idx is not None:
+                    overflow_start = len(pres.slides)
+                    renderer(pres, d, P, meta)
+                    extras = list(range(overflow_start, len(pres.slides)))
+                    used_template_indices.discard(tpl_idx)
+            
+            elif stype == "summary":
+                overflow_start = len(pres.slides)
+                render_summary(pres, d, P, meta)
+                extras = list(range(overflow_start, len(pres.slides)))
+        
+        except Exception as e:
+            print(f"  ⚠ {stype}: extra slides error ({e})")
+        
+        if extras:
+            extra_indices[stype] = extras
+            print(f"  + {stype}: {len(extras)} extra slides")
+    
+    # ── Phase 5: Build final slide order ──
+    final_order = [0]  # Title slide
+    
+    for item in ordered:
+        d = item.get("data", {})
+        stype = d.get("section_type", item.get("id", ""))
+        
+        # Add divider
+        div_idx = divider_indices.get(stype)
+        if div_idx is not None:
+            final_order.append(div_idx)
+        
+        # Add content slide(s)
+        if stype in extra_indices:
+            # Use programmatic slides instead of template slide
+            final_order.extend(extra_indices[stype])
+        else:
+            # Use template slide
+            tpl_idx = SECTION_TO_SLIDE.get(stype)
+            if tpl_idx is not None and tpl_idx in used_template_indices:
+                final_order.append(tpl_idx)
+            elif tpl_idx is None and stype not in extra_indices:
+                # Unknown section — try programmatic fallback
+                renderer = SECTION_RENDERERS.get(stype)
+                if renderer:
+                    try:
+                        fallback_start = len(pres.slides)
+                        renderer(pres, d, P, meta)
+                        for fi in range(fallback_start, len(pres.slides)):
+                            final_order.append(fi)
+                    except Exception as e:
+                        print(f"  ⚠ {stype}: fallback render error ({e})")
+    
+    # ── Phase 6: Add references slide ──
+    ref_layout = pres.slides[0].slide_layout  # Use same layout as title for master inheritance
+    ref_sl = pres.slides.add_slide(ref_layout)
+    # Clear placeholder shapes
+    for shape in list(ref_sl.shapes):
+        shape._element.getparent().remove(shape._element)
+    
+    _slide_header(ref_sl, "References", P, f"MedAI Suite · {len(set(all_refs))} sources")
+    unique_refs = list(dict.fromkeys(all_refs))[:30]
+    ref_text = "\n".join(f"[{i+1}] {r}" for i, r in enumerate(unique_refs) if r)
+    _add_textbox(ref_sl, MX, Inches(1.1), MW, Inches(5.8),
+                 ref_text or "No references collected.",
+                 font_size=8, font_color=P["muted"], font_name="DM Mono")
+    final_order.append(len(pres.slides) - 1)
+    
+    # ── Phase 7: Reorder and remove unused slides ──
+    print(f"  Final: {len(final_order)} slides (from {len(pres.slides)} total)")
+    _reorder_and_keep(pres, final_order)
+    
+    # Write to bytes
+    buf = io.BytesIO()
+    pres.save(buf)
+    buf.seek(0)
+    print(f"  ✅ IN-PLACE render complete: {buf.getbuffer().nbytes // 1024} KB")
+    return buf.read()
+
+
+def _render_programmatic(meta, ordered, all_refs, P, theme):
+    """
+    PROGRAMMATIC rendering: Fallback when no full template available.
+    Builds all slides from scratch. Works but no designer backgrounds.
+    """
+    pres = Presentation()
+    pres.slide_width = SLIDE_W
+    pres.slide_height = SLIDE_H
+
+    # ── Title slide ──
+    title_sl = _new_slide(pres, P)
+    _add_rect(title_sl, Inches(0), Inches(0), SLIDE_W, SLIDE_H, P["bg"])
+    _add_rect(title_sl, MX, Inches(2.2), Inches(4), Inches(0.06), P["teal"])
+    _add_textbox(title_sl, MX, Inches(2.5), MW, Inches(1.2),
+                 meta.get("drug", "Medical Affairs Plan"),
+                 font_size=36, font_color=P["white"], bold=True)
+    scope = meta.get("country") or meta.get("region") or "Global"
+    _add_textbox(title_sl, MX, Inches(3.6), MW, Inches(0.6),
+                 f"{scope} Medical Affairs Plan — {meta.get('year', '')}",
+                 font_size=16, font_color=P["muted"])
+    _add_textbox(title_sl, MX, Inches(4.3), MW, Inches(0.4),
+                 meta.get("indication", ""), font_size=12, font_color=P["teal"])
+    _add_textbox(title_sl, MX, Inches(5.2), MW, Inches(0.4),
+                 f"{len(ordered)} Sections · {len(set(all_refs))} References · {meta.get('model', 'Claude')}",
+                 font_size=10, font_color=P["dim"], font_name="DM Mono")
+    _add_textbox(title_sl, MX, Inches(6.8), MW, Inches(0.3),
+                 "MedAI Suite Premium · AI-Verified by ELISE",
+                 font_size=8, font_color=P["dim"], font_name="DM Mono")
+
+    # ── Content slides ──
     for sec_num, item in enumerate(ordered, 1):
         d = item.get("data", {})
         stype = d.get("section_type", item.get("id", ""))
         label = item.get("label", stype)
 
-        # ── Divider slide ──
-        divider_tpl_path = template_manager.get_template_path(theme, "_divider")
-        if divider_tpl_path:
-            div_sl = _clone_template_slide(pres, str(divider_tpl_path))
-            if div_sl:
-                _fill_divider(div_sl, sec_num, label)
-            else:
-                _add_divider_slide(pres, sec_num, label, P)
-        else:
-            _add_divider_slide(pres, sec_num, label, P)
+        # Divider
+        _add_divider_slide(pres, sec_num, label, P)
 
-        # ── Content slide: try TEMPLATE first, then PROGRAMMATIC ──
-        template_used = False
-        
-        # Map section_type to template filename
-        tpl_name = stype
-        # Handle aliases
-        if tpl_name in ("strategic_imperatives",):
-            tpl_name = "imperatives"
-        if tpl_name in ("tactical_plan",):
-            tpl_name = "tactics"
-        
-        tpl_path = template_manager.get_template_path(theme, tpl_name)
-        if tpl_path:
-            tpl_slide = _clone_template_slide(pres, str(tpl_path))
-            if tpl_slide:
-                # Try to fill the template
-                filler = TEMPLATE_FILLERS.get(stype)
-                if filler:
-                    try:
-                        filler(tpl_slide, d, meta)
-                        template_used = True
-                        print(f"  ✓ {label}: template + fill")
-                    except Exception as e:
-                        print(f"  ⚠ {label}: template fill failed ({e}), using programmatic")
-                        # Remove the failed template slide
-                        rId = pres.slides._sldIdLst[-1].get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id', '')
-                        pres.part.drop_rel(rId)
-                        pres.slides._sldIdLst.remove(pres.slides._sldIdLst[-1])
-                else:
-                    # No specific filler — just set header_title
-                    _fill_generic_header_only(tpl_slide, d, meta, label)
-                    template_used = True
-                    print(f"  ✓ {label}: template (header only)")
-        
-        if not template_used:
-            # Fallback: programmatic rendering
-            renderer = SECTION_RENDERERS.get(stype)
-            if renderer:
-                try:
-                    renderer(pres, d, P, meta)
-                    print(f"  → {label}: programmatic")
-                except Exception as e:
-                    print(f"  ✗ {label}: render error ({e})")
-                    render_generic(pres, d, P, meta, label)
-            else:
+        # Content
+        renderer = SECTION_RENDERERS.get(stype)
+        if renderer:
+            try:
+                renderer(pres, d, P, meta)
+            except Exception as e:
+                print(f"  ✗ {label}: render error ({e})")
                 render_generic(pres, d, P, meta, label)
+        else:
+            render_generic(pres, d, P, meta, label)
 
-    # ── REFERENCES SLIDE ──
+    # ── References ──
     ref_sl = _new_slide(pres, P)
     ref_sl.background.fill.solid()
     ref_sl.background.fill.fore_color.rgb = _rgb(P["bg"])
@@ -1316,8 +1653,8 @@ def render_pptx(meta: dict, sections: list[dict], template_id: str = "dark") -> 
                  ref_text or "No references collected.",
                  font_size=8, font_color=P["muted"], font_name="DM Mono")
 
-    # Write to bytes
     buf = io.BytesIO()
     pres.save(buf)
     buf.seek(0)
+    print(f"  ✅ PROGRAMMATIC render complete: {buf.getbuffer().nbytes // 1024} KB")
     return buf.read()

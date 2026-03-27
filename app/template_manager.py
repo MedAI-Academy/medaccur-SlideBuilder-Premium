@@ -51,6 +51,14 @@ def get_template_path(theme: str, section_type: str) -> Path | None:
     return None
 
 
+def get_full_template_path(theme: str) -> Path | None:
+    """Get path to the full 20-slide template for a theme, or None if not found."""
+    path = TEMPLATE_DIR / theme / "_full.pptx"
+    if path.exists():
+        return path
+    return None
+
+
 def load_template(theme: str, section_type: str) -> Presentation | None:
     """Load a template PPTX for a given theme and section type."""
     path = get_template_path(theme, section_type)

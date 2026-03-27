@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .schemas import RenderRequest, ValidateTemplateRequest, ValidateTemplateResponse, HealthResponse
 from .renderer import render_pptx, PALETTES
-from .template_manager import list_available_themes, validate_template
+from .template_manager import list_available_themes, validate_template, get_full_template_path
 
 app = FastAPI(
     title="MedAI Premium PPTX Renderer",
@@ -38,8 +38,10 @@ app.add_middleware(
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
+    themes_with_full = [t for t in list_available_themes() if get_full_template_path(t)]
     return HealthResponse(
         templates_available=list(PALETTES.keys()),
+        inplace_themes=themes_with_full,
     )
 
 
@@ -48,6 +50,7 @@ async def list_templates():
     """List all available template themes with metadata."""
     templates = []
     for key, pal in PALETTES.items():
+        has_full = get_full_template_path(key) is not None
         templates.append({
             "id": key,
             "name": {
@@ -56,6 +59,9 @@ async def list_templates():
                 "gray": "McKinsey / BCG Style",
                 "pharma": "Pharma Corporate Blue",
                 "premium": "Black & Gold Premium",
+                "normal": "MedAI Normal",
+                "gold": "MedAI Gold",
+                "aquarell": "MedAI Aquarell",
             }.get(key, key),
             "colors": {
                 "bg": f"#{pal['bg']}",
@@ -64,6 +70,8 @@ async def list_templates():
                 "text": f"#{pal['text']}",
             },
             "has_designer_templates": key in list_available_themes(),
+            "inplace_ready": has_full,
+            "render_mode": "inplace" if has_full else "programmatic",
         })
     return {"templates": templates}
 

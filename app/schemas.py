@@ -35,5 +35,6 @@ class ValidateTemplateResponse(BaseModel):
 class HealthResponse(BaseModel):
     service: str = "medai-pptx-premium"
     status: str = "ok"
-    version: str = "1.0.0"
+    version: str = "2.0.0"
     templates_available: list[str] = []
+    inplace_themes: list[str] = []
