@@ -136,11 +136,66 @@ def _find_shape(slide, name: str):
     return None
 
 
-def _set_text(shape, text: str):
+def _find_shapes_by_name(slide, name: str) -> list:
+    """Find ALL shapes with a given name (handles duplicates like 'Oval 40')."""
+    return [s for s in slide.shapes if s.name == name]
+
+
+def _get_text_color_deep(shape):
     """
-    Replace ALL text in a shape while preserving the first run's formatting.
-    This is the safe approach — we don't search for {{placeholders}},
-    we replace the entire text frame content.
+    Extract the DESIGNER'S intended text color from a shape's XML.
+    Scans rPr (run properties) and defRPr (default run properties)
+    for the first explicit color, resolving schemeClr via SLIDEWORKS_THEME.
+    
+    This is critical because:
+    - Slideworks 2025 theme defines bg2 = lt2 = #FFFFFF
+    - Many shapes inherit white text via schemeClr="bg2"
+    - When we replace runs, the schemeClr reference is lost
+    - So we must extract and re-apply the ORIGINAL color explicitly
+    """
+    if not hasattr(shape, 'text_frame'):
+        return None
+    A = '{http://schemas.openxmlformats.org/drawingml/2006/main}'
+    root = etree.fromstring(etree.tostring(shape._element))
+    
+    # Check rPr (explicit run properties) first
+    for rPr in root.iter(f'{A}rPr'):
+        sf = rPr.find(f'{A}solidFill')
+        if sf is not None:
+            sr = sf.find(f'{A}srgbClr')
+            if sr is not None:
+                return sr.get('val')
+            sc = sf.find(f'{A}schemeClr')
+            if sc is not None:
+                return SLIDEWORKS_THEME.get(sc.get('val'), '000000')
+    
+    # Check defRPr (default run properties)
+    for defRPr in root.iter(f'{A}defRPr'):
+        sf = defRPr.find(f'{A}solidFill')
+        if sf is not None:
+            sr = sf.find(f'{A}srgbClr')
+            if sr is not None:
+                return sr.get('val')
+            sc = sf.find(f'{A}schemeClr')
+            if sc is not None:
+                return SLIDEWORKS_THEME.get(sc.get('val'), '000000')
+    
+    return None
+
+
+def _set_text(shape, text: str, force_color: str = None):
+    """
+    Replace ALL text in a shape, preserving the DESIGNER'S original text color.
+    
+    Key insight: The Slideworks template uses schemeClr references (bg2, tx1, etc.)
+    for text colors. When python-pptx replaces runs, these references are lost.
+    We extract the original color from XML BEFORE clearing, then re-apply it
+    explicitly as srgbClr on every new run.
+    
+    Args:
+        shape: PowerPoint shape with text_frame
+        text: New text content (supports \n for multi-line)
+        force_color: Optional hex color to override (e.g. "FFFFFF" for white)
     """
     if shape is None or not hasattr(shape, 'text_frame'):
         return
@@ -148,9 +203,14 @@ def _set_text(shape, text: str):
     if not tf.paragraphs:
         return
     
+    A_NS = '{http://schemas.openxmlformats.org/drawingml/2006/main}'
+    
+    # Get designer's intended color BEFORE clearing text
+    color_hex = force_color or _get_text_color_deep(shape) or "2D3748"
+    
     # Save formatting from first run of first paragraph
     first_p = tf.paragraphs[0]
-    saved_font = None
+    saved_font = {}
     if first_p.runs:
         r = first_p.runs[0]
         saved_font = {
@@ -159,50 +219,39 @@ def _set_text(shape, text: str):
             'italic': r.font.italic,
             'name': r.font.name,
         }
-        try:
-            saved_font['color'] = r.font.color.rgb
-        except Exception:
-            saved_font['color'] = None
     saved_alignment = first_p.alignment
     
-    # Clear all paragraphs (remove XML elements)
-    p_elements = list(tf._txBody.iterchildren(
-        '{http://schemas.openxmlformats.org/drawingml/2006/main}p'
-    ))
-    for p_el in p_elements[1:]:  # Keep first, remove rest
+    # Clear all paragraphs except first
+    p_elements = list(tf._txBody.iterchildren(f'{A_NS}p'))
+    for p_el in p_elements[1:]:
         tf._txBody.remove(p_el)
     
-    # Handle multi-line text: split by \n and create paragraphs
-    lines = text.split('\n')
+    # Handle multi-line text
+    lines = str(text).split('\n')
     for i, line in enumerate(lines):
         if i == 0:
-            # Reuse first paragraph
             p = tf.paragraphs[0]
-            # Clear existing runs
-            for r_el in list(p._p.iterchildren(
-                '{http://schemas.openxmlformats.org/drawingml/2006/main}r'
-            )):
+            for r_el in list(p._p.iterchildren(f'{A_NS}r')):
                 p._p.remove(r_el)
         else:
-            # Add new paragraph
             p = tf.add_paragraph()
         
         p.alignment = saved_alignment
         run = p.add_run()
         run.text = line
         
+        # Apply explicit color (never rely on inheritance)
+        run.font.color.rgb = RGBColor.from_string(color_hex)
+        
         # Apply saved formatting
-        if saved_font:
-            if saved_font['size']:
-                run.font.size = saved_font['size']
-            if saved_font['bold'] is not None:
-                run.font.bold = saved_font['bold']
-            if saved_font['italic'] is not None:
-                run.font.italic = saved_font['italic']
-            if saved_font['name']:
-                run.font.name = saved_font['name']
-            if saved_font['color']:
-                run.font.color.rgb = saved_font['color']
+        if saved_font.get('size'):
+            run.font.size = saved_font['size']
+        if saved_font.get('bold') is not None:
+            run.font.bold = saved_font['bold']
+        if saved_font.get('italic') is not None:
+            run.font.italic = saved_font['italic']
+        if saved_font.get('name'):
+            run.font.name = saved_font['name']
 
 
 # ══════════════════════════════════════════════════════════
@@ -212,20 +261,15 @@ def _set_text(shape, text: str):
 # ══════════════════════════════════════════════════════════
 
 def _fill_title(slide, meta: dict, ordered_count: int, ref_count: int):
-    """Fill a cloned title slide template."""
-    drug = meta.get("drug", "Medical Affairs Plan")
+    """Fill the title slide (slide 0)."""
+    _set_text(_find_shape(slide, "title_drug"), meta.get("drug", "Medical Affairs Plan"))
     scope = meta.get("country") or meta.get("region") or "Global"
-    year = meta.get("year", "")
-    indication = meta.get("indication", "")
-    
-    _set_text(_find_shape(slide, "title_drug"), drug)
-    _set_text(_find_shape(slide, "title_subtitle"), f"{scope} Medical Affairs Plan — {year}")
-    _set_text(_find_shape(slide, "title_year"), indication)
-    # title_logo left as-is (company can replace)
+    _set_text(_find_shape(slide, "title_subtitle"), f"{scope} Medical Affairs Plan — {meta.get('year', '')}")
+    _set_text(_find_shape(slide, "title_year"), meta.get("indication", ""))
 
 
 def _fill_divider(slide, num: int, title: str):
-    """Fill a cloned divider slide template."""
+    """Fill a divider slide."""
     _set_text(_find_shape(slide, "divider_number"), str(num).zfill(2))
     _set_text(_find_shape(slide, "divider_title"), title)
 
@@ -235,167 +279,409 @@ def _fill_executive_summary(slide, d: dict, meta: dict):
               f"Executive Summary — {meta.get('country','Global')} {meta.get('year','')}")
     rows = d.get("rows", [])
     body = "\n\n".join(
-        f"{r.get('icon','')} {r.get('topic','')}: {r.get('summary','')}"
-        for r in rows[:6]
+        f"{r.get('icon','')} {r.get('topic','')}\n{r.get('summary','')}"
+        for r in rows[:8]
     )
-    _set_text(_find_shape(slide, "body_text"), body)
+    _set_text(_find_shape(slide, "body_text"), body or "No executive summary data.")
 
 
-def _fill_swot(slide, d: dict, meta: dict):
+def _fill_disease_intro(slide, d: dict, meta: dict):
     _set_text(_find_shape(slide, "header_title"),
-              f"SWOT Analysis — {meta.get('drug','')} {meta.get('country','Global')}")
-    for key, shape_name in [("strengths","s_title"),("weaknesses","w_title"),
-                             ("opportunities","o_title"),("threats","t_title")]:
-        items = d.get(key, [])
-        text = "\n".join(f"• {_str(item)}" for item in items[:5])
-        shape = _find_shape(slide, shape_name)
-        if shape:
-            # For SWOT, the title shapes contain both title and bullets
-            # We prepend the category name
-            label = key.capitalize()
-            _set_text(shape, f"{label}\n{text}")
+              f"Disease Introduction — {meta.get('indication', '')}")
+    slides_data = d.get("slides", [{}])
+    sl_data = slides_data[0] if slides_data else {}
+    items = sl_data.get("items", [])
+    if items:
+        body = "\n\n".join(f"{_str(it.get('label',''))}\n{_str(it.get('text',''))}" for it in items[:8])
+    else:
+        lines = [f"{k}: {_str(v)}" for k, v in d.items() if k != "section_type" and not isinstance(v, (dict, list))]
+        body = "\n\n".join(lines)
+    _set_text(_find_shape(slide, "body_text"), body or "No disease introduction data.")
 
 
-def _fill_imperatives(slide, d: dict, meta: dict):
+def _fill_prevalence_kpi(slide, d: dict, meta: dict):
+    """Slide 5: 3 label shapes below circles + takeaway bar. Don't write in circle shapes (icons block them)."""
     _set_text(_find_shape(slide, "header_title"),
-              f"Strategic Imperatives — {meta.get('country','Global')} {meta.get('year','')}")
-    pillars = d.get("pillars", [])
-    for i, pillar in enumerate(pillars[:3]):
-        shape = _find_shape(slide, f"pillar_{i+1}_card")
-        if shape:
-            title = _str(pillar.get("title", ""))
-            objs = "\n".join(f"• {_str(o)[:90]}" for o in pillar.get("objectives", [])[:4])
-            _set_text(shape, f"{title}\n\n{objs}")
+              f"Prevalence & Epidemiology — {meta.get('country','Global')}")
+    kpis = d.get("kpis", [])
+    # Labels below circles: combine label + value
+    label_shapes = ["Google Shape;606;p17", "Google Shape;607;p17", "Google Shape;608;p17"]
+    for i, k in enumerate(kpis[:3]):
+        if i < len(label_shapes):
+            _set_text(_find_shape(slide, label_shapes[i]),
+                      f"{_str(k.get('label',''))}\n{_str(k.get('value',''))}")
+    # Takeaway bar
+    ctx = d.get("context_table", [])
+    if ctx:
+        summary = " | ".join(f"{_str(c.get('metric',''))}: {_str(c.get('value',''))}" for c in ctx[:3])
+    else:
+        summary = f"{len(kpis)} epidemiology metrics collected"
+    _set_text(_find_shape(slide, "Rectangle 28"), summary)
+    # Source
+    sources = [_str(k.get('source','')) for k in kpis[:3] if k.get('source')]
+    _set_text(_find_shape(slide, "Google Shape;507;p14"),
+              f"Source: {', '.join(sources)[:80]}" if sources else "")
 
 
-def _fill_narrative(slide, d: dict, meta: dict):
+def _fill_moa(slide, d: dict, meta: dict):
+    """Slide 10: step_1-4, Chevron 14, Rectangle 34-44 descriptions."""
     _set_text(_find_shape(slide, "header_title"),
-              f"Scientific Narrative — {meta.get('drug','')}")
-    _set_text(_find_shape(slide, "findings_header"), "Key Evidence")
-    _set_text(_find_shape(slide, "reco_header"), "Positioning")
-    
-    msg = d.get("primary_message", "")
-    tps = d.get("talking_points", [])
-    evidence = msg + "\n\n" + "\n".join(
-        f"• {_str(tp.get('focus',''))}: {', '.join(_str(p) for p in tp.get('points',[])[:2])}"
-        for tp in tps[:4]
-    ) if tps else msg
-    _set_text(_find_shape(slide, "findings_body"), evidence.strip())
-    
-    positioning = d.get("competitive_context", d.get("key_evidence_statement", ""))
-    _set_text(_find_shape(slide, "reco_body"), positioning)
+              f"Mechanism of Action — {meta.get('drug','')}")
+    _set_text(_find_shape(slide, "Subtitle 2"),
+              f"{_str(d.get('drug_class',''))} · Target: {_str(d.get('target',''))}")
+    steps = d.get("pathway_steps", [])
+    title_shapes = ["step_1", "step_2", "Chevron 14", "step_3", "step_4"]
+    desc_shapes = ["Rectangle 34", "Rectangle 36", "Rectangle 43", "Rectangle 44", "Rectangle 35"]
+    for i, s in enumerate(steps[:5]):
+        if i < len(title_shapes):
+            _set_text(_find_shape(slide, title_shapes[i]), _str(s.get("title", f"Step {i+1}")))
+        if i < len(desc_shapes):
+            _set_text(_find_shape(slide, desc_shapes[i]), _str(s.get("description", "")))
+    _set_text(_find_shape(slide, "Google Shape;507;p14"),
+              f"Source: {_str(d.get('source', d.get('key_reference','')))[:80]}")
+
+
+def _fill_pivotal_table(slide, d: dict, meta: dict):
+    """Slide 4: KPIs in TextBoxes. Remove placeholder Chart 16."""
+    _set_text(_find_shape(slide, "header_title"), f"Pivotal Studies — {meta.get('drug','')}")
+    trials = d.get("trials", [])
+    active = [t for t in trials if t.get("include_in_map") is not False]
+    # Remove template placeholder chart (meaningless bar chart)
+    chart_shape = _find_shape(slide, "Chart 16")
+    if chart_shape:
+        try:
+            chart_shape._element.getparent().remove(chart_shape._element)
+        except Exception:
+            pass
+    if active:
+        tr = active[0]
+        eff = tr.get("efficacy", {})
+        _set_text(_find_shape(slide, "Subtitle 28"),
+                  f"{_str(tr.get('name',''))} — {_str(tr.get('phase',''))} — {_str(tr.get('design',''))}")
+        _set_text(_find_shape(slide, "TextBox 2"),
+                  f"mPFS: {_str(eff.get('mpfs_drug','N/A'))} vs {_str(eff.get('mpfs_control','N/A'))} · HR {_str(eff.get('hr_pfs','N/A'))} · ORR {_str(eff.get('orr_drug','N/A'))}")
+        # Clear overlapping TextBoxes
+        _set_text(_find_shape(slide, "TextBox 10"), "")
+        _set_text(_find_shape(slide, "TextBox 7"), "")
+        _set_text(_find_shape(slide, "TextBox 8"),
+                  f"N={_str(tr.get('n_total','N/A'))} · mOS: {_str(eff.get('mos_drug','NR'))}")
+        saf = tr.get("safety", {})
+        details = []
+        if saf.get("grade34_heme"):
+            details.append("G3-4 Heme: " + ", ".join(_str(s) for s in saf["grade34_heme"][:3]))
+        if saf.get("grade34_nonheme"):
+            details.append("G3-4 Non-heme: " + ", ".join(_str(s) for s in saf["grade34_nonheme"][:3]))
+        if saf.get("discontinuation_rate"):
+            details.append(f"D/C: {_str(saf['discontinuation_rate'])}")
+        _set_text(_find_shape(slide, "TextBox 17"), "\n".join(details))
+        _set_text(_find_shape(slide, "Google Shape;507;p14"), f"Source: {_str(tr.get('source',''))[:80]}")
 
 
 def _fill_differentiators(slide, d: dict, meta: dict):
-    _set_text(_find_shape(slide, "header_title"),
-              f"Key Differentiators — {meta.get('drug','')}")
+    """Slide 6: card_1-4 + clear 'Icon' text from Oval 12-15."""
+    _set_text(_find_shape(slide, "header_title"), f"Key Differentiators — {meta.get('drug','')}")
     diffs = d.get("differentiators", [])
     for i, df in enumerate(diffs[:4]):
         shape = _find_shape(slide, f"card_{i+1}")
         if shape:
-            _set_text(shape, f"{_str(df.get('title',''))}\n{_str(df.get('detail', df.get('evidence','')))}")
+            _set_text(shape, f"{_str(df.get('title',''))}\n\n{_str(df.get('detail', df.get('evidence','')))}")
+    # Clear "Icon" text from Ovals (decorative circles with picture overlay)
+    for n in ["Oval 12", "Oval 13", "Oval 14", "Oval 15"]:
+        _set_text(_find_shape(slide, n), "")
 
 
-def _fill_competitor_table(slide, d: dict, meta: dict):
+def _fill_areas_interest(slide, d: dict, meta: dict):
+    """Slide 7: 5x (Text Placeholder 6 = area name, Rectangle 89 = description)."""
     _set_text(_find_shape(slide, "header_title"),
-              f"Competitive Landscape — {meta.get('country','Global')} {meta.get('year','')}")
-    _set_text(_find_shape(slide, "source_text"), "Source: EMA EPAR, FDA, NCCN")
-    
-    # Insert chart image into chart_area placeholder
-    chart_shape = _find_shape(slide, "chart_area")
-    if chart_shape and d.get("rows"):
-        rows = d.get("rows", [])
-        if len(rows) >= 3:
-            theme_key = "dark"  # TODO: pass theme
-            chart_png = chart_renderer.render_mpfs_bar_chart(
-                rows=rows, focus_drug=meta.get("drug", ""), theme=theme_key
-            )
-            if chart_png:
-                # Replace placeholder with image at same position
-                left = chart_shape.left
-                top = chart_shape.top
-                width = chart_shape.width
-                height = chart_shape.height
-                # Remove the placeholder shape
-                sp = chart_shape._element
-                sp.getparent().remove(sp)
-                # Add image
-                img_stream = io.BytesIO(chart_png)
-                slide.shapes.add_picture(img_stream, left, top, width, height)
+              f"Areas of Interest (ISR) — {meta.get('drug','')}")
+    areas = d.get("areas", [])
+    area_names = _find_shapes_by_name(slide, "Text Placeholder 6")
+    area_descs = _find_shapes_by_name(slide, "Rectangle 89")
+    for i in range(min(5, len(area_names))):
+        if i < len(areas):
+            area = areas[i]
+            _set_text(area_names[i], _str(area.get("area", f"Area {i+1}")))
+            interests = area.get("interests", [])
+            desc = " · ".join(_str(it)[:60] for it in interests[:4])
+            if i < len(area_descs):
+                _set_text(area_descs[i], desc)
+        else:
+            _set_text(area_names[i], "")
+            if i < len(area_descs):
+                _set_text(area_descs[i], "")
 
 
-def _fill_unmet_needs(slide, d: dict, meta: dict):
+def _fill_iep(slide, d: dict, meta: dict):
+    """Slide 8: Fill existing 8x5 table_area."""
     _set_text(_find_shape(slide, "header_title"),
-              f"Unmet Medical Needs — {meta.get('country','Global')}")
-    needs = d.get("needs", [])
-    challenges = "\n\n".join(
-        f"{'🔴' if n.get('magnitude')=='HIGH' else '🟡'} {_str(n.get('title',''))}"
-        for n in needs[:4]
-    )
-    details = "\n\n".join(_str(n.get("detail", "")) for n in needs[:4])
-    _set_text(_find_shape(slide, "challenges_header"), "Unmet Needs")
-    _set_text(_find_shape(slide, "solutions_header"), "Details")
-    # Fill body areas if they exist
-    body1 = _find_shape(slide, "TextBox 20")
-    if body1:
-        _set_text(body1, challenges)
-    body2 = _find_shape(slide, "TextBox 64") 
-    if not body2:
-        body2 = _find_shape(slide, "TextBox 63")
-    if body2:
-        _set_text(body2, details)
-
-
-def _fill_generic_header_only(slide, d: dict, meta: dict, label: str):
-    """For sections where we only have header_title, fill that and leave rest as-is."""
-    _set_text(_find_shape(slide, "header_title"), label)
-
-
-def _fill_treatment_algo(slide, d: dict, meta: dict):
-    _set_text(_find_shape(slide, "header_title"),
-              f"Treatment Landscape — {meta.get('country','Global')}")
-    # Fill table if it exists
+              f"Integrated Evidence Plan — {meta.get('drug','')} {meta.get('year','')}")
     table_shape = _find_shape(slide, "table_area")
-    if table_shape and hasattr(table_shape, 'table'):
-        lines = d.get("lines", [])
-        # Flatten regimens into rows
-        rows_data = []
-        for line in lines:
-            regs = line.get("regimens", [])
-            if isinstance(regs, str):
-                regs = [regs]
-            for reg in regs[:8]:
-                rows_data.append([_str(line.get("line", "")), _str(reg)])
-        # Fill table cells
+    if table_shape is None:
+        return
+    try:
         tbl = table_shape.table
-        for ri, row_data in enumerate(rows_data[:min(len(tbl.rows)-1, 10)]):
-            for ci, cell_text in enumerate(row_data[:min(len(tbl.columns), 4)]):
-                try:
-                    tbl.cell(ri+1, ci).text = cell_text[:100]
-                except Exception:
-                    pass
+    except Exception:
+        return
+    gaps = d.get("gaps", [])
+    for ri, g in enumerate(gaps[:tbl.rows.__len__() - 1]):
+        data = [_str(g.get("gap",""))[:80], _str(g.get("activity",""))[:80],
+                _str(g.get("responsible",""))[:40], _str(g.get("status",""))[:30],
+                _str(g.get("source",""))[:50]]
+        for ci in range(min(len(data), tbl.columns.__len__())):
+            try:
+                cell = tbl.cell(ri + 1, ci)
+                cell.text = data[ci]
+                for p in cell.text_frame.paragraphs:
+                    for run in p.runs:
+                        run.font.size = Pt(9)
+            except Exception:
+                pass
+    # Clear unused rows
+    for ri in range(len(gaps) + 1, tbl.rows.__len__()):
+        for ci in range(tbl.columns.__len__()):
+            try:
+                tbl.cell(ri, ci).text = ""
+            except Exception:
+                pass
 
 
 def _fill_guidelines(slide, d: dict, meta: dict):
-    _set_text(_find_shape(slide, "header_title"),
-              f"Guidelines — {meta.get('drug','')}")
+    """Slide 9: Fill existing 6x5 table_area."""
+    _set_text(_find_shape(slide, "header_title"), f"Guidelines — {meta.get('drug','')}")
     table_shape = _find_shape(slide, "table_area")
-    if table_shape and hasattr(table_shape, 'table'):
-        rows = d.get("rows", d.get("guidelines", []))
+    if table_shape is None:
+        return
+    try:
         tbl = table_shape.table
-        for ri, r in enumerate(rows[:min(len(tbl.rows)-1, 10)]):
-            data = [_str(r.get("guideline","")), _str(r.get("line","")),
-                    _str(r.get("recommendation","")), _str(r.get("source",""))]
-            for ci, text in enumerate(data[:min(len(tbl.columns), 4)]):
-                try:
-                    tbl.cell(ri+1, ci).text = text[:120]
-                except Exception:
-                    pass
+    except Exception:
+        return
+    rows = d.get("rows", d.get("guidelines", []))
+    for ri, r in enumerate(rows[:tbl.rows.__len__() - 1]):
+        data = [_str(r.get("guideline",""))[:60], _str(r.get("line",""))[:40],
+                _str(r.get("recommendation",""))[:100], _str(r.get("source",""))[:50]]
+        for ci in range(min(len(data), tbl.columns.__len__())):
+            try:
+                cell = tbl.cell(ri + 1, ci)
+                cell.text = data[ci]
+                for p in cell.text_frame.paragraphs:
+                    for run in p.runs:
+                        run.font.size = Pt(9)
+            except Exception:
+                pass
+    for ri in range(len(rows) + 1, tbl.rows.__len__()):
+        for ci in range(tbl.columns.__len__()):
+            try:
+                tbl.cell(ri, ci).text = ""
+            except Exception:
+                pass
 
 
+def _fill_treatment_algo(slide, d: dict, meta: dict):
+    """Slide 12: Fill 13x3 table_area. Col 1 stays empty (Ovals overlap it)."""
+    _set_text(_find_shape(slide, "header_title"),
+              f"Treatment Landscape — {meta.get('country','Global')}")
+    table_shape = _find_shape(slide, "table_area")
+    if table_shape is None:
+        return
+    try:
+        tbl = table_shape.table
+    except Exception:
+        return
+    lines = d.get("lines", [])
+    flat_rows = []
+    for line in lines:
+        regs = line.get("regimens", [])
+        if isinstance(regs, str):
+            regs = [regs]
+        for reg in regs[:8]:
+            if isinstance(reg, dict):
+                name = _str(reg.get("name", reg.get("regimen", "")))
+                note = _str(reg.get("note", reg.get("approval_status", "")))
+                flat_rows.append([_str(line.get("line", "")), "", f"       {name} — {note}"])
+            else:
+                flat_rows.append([_str(line.get("line", "")), "", f"       {_str(reg)}"])
+    for ri, row in enumerate(flat_rows[:tbl.rows.__len__() - 1]):
+        for ci in range(min(len(row), tbl.columns.__len__())):
+            try:
+                cell = tbl.cell(ri + 1, ci)
+                cell.text = row[ci][:100]
+                for p in cell.text_frame.paragraphs:
+                    for run in p.runs:
+                        run.font.size = Pt(9)
+            except Exception:
+                pass
+    for ri in range(len(flat_rows) + 1, tbl.rows.__len__()):
+        for ci in range(tbl.columns.__len__()):
+            try:
+                tbl.cell(ri, ci).text = ""
+            except Exception:
+                pass
+
+
+def _fill_imperatives(slide, d: dict, meta: dict):
+    """Slide 11: Rectangle 39/80/81/82 (pillars) + Rectangle 53 (base bar)."""
+    _set_text(_find_shape(slide, "header_title"),
+              f"Strategic Imperatives — {meta.get('country','Global')} {meta.get('year','')}")
+    pillars = d.get("pillars", [])
+    pillar_shapes = ["Rectangle 39", "Rectangle 80", "Rectangle 81", "Rectangle 82"]
+    for i, pillar in enumerate(pillars[:4]):
+        if i < len(pillar_shapes):
+            shape = _find_shape(slide, pillar_shapes[i])
+            if shape:
+                title = _str(pillar.get("title", ""))
+                objs = "\n".join(f"• {_str(o)[:80]}" for o in pillar.get("objectives", [])[:4])
+                _set_text(shape, f"{title}\n\n{objs}")
+    base = _find_shape(slide, "Rectangle 53")
+    if base:
+        _set_text(base, f"MEDICAL AFFAIRS PLAN — {meta.get('drug','')} — {meta.get('year','')}")
+
+
+def _fill_tactics(slide, d: dict, meta: dict):
+    """Slide 13: 3 categories (Rectangle 2/8/9), initiatives (7/10/11), outcomes (12/13/14)."""
+    _set_text(_find_shape(slide, "header_title"), f"Tactical Plan — {meta.get('year','')}")
+    rows = d.get("rows", [])
+    categories = {}
+    for r in rows:
+        cat = _str(r.get("type", "Other"))
+        if cat not in categories:
+            categories[cat] = []
+        categories[cat].append(r)
+    cat_list = list(categories.items())[:3]
+    cat_titles = ["Rectangle 2", "Rectangle 8", "Rectangle 9"]
+    cat_inits = ["Rectangle 7", "Rectangle 10", "Rectangle 11"]
+    cat_outcomes = ["Rectangle 12", "Rectangle 13", "Rectangle 14"]
+    for i, (cat_name, cat_rows) in enumerate(cat_list):
+        if i < len(cat_titles):
+            _set_text(_find_shape(slide, cat_titles[i]), cat_name)
+        if i < len(cat_inits):
+            inits = "\n".join(f"• {_str(r.get('tactic',''))[:50]}" for r in cat_rows[:4])
+            _set_text(_find_shape(slide, cat_inits[i]), inits)
+        if i < len(cat_outcomes):
+            kpis = "\n".join(_str(r.get("kpi", r.get("description","")))[:40] for r in cat_rows[:2])
+            _set_text(_find_shape(slide, cat_outcomes[i]), kpis or "KPIs TBD")
+
+
+def _fill_narrative(slide, d: dict, meta: dict):
+    """Slide 14: Rectangle 19 (summary), findings_body, reco_body."""
+    _set_text(_find_shape(slide, "header_title"), f"Scientific Narrative — {meta.get('drug','')}")
+    _set_text(_find_shape(slide, "Rectangle 19"),
+              _str(d.get("primary_message", ""))[:200])
+    tps = d.get("talking_points", [])
+    evidence = "\n\n".join(
+        f"• {_str(tp.get('focus',''))}: {', '.join(_str(p)[:50] for p in tp.get('points',[])[:3])}"
+        for tp in tps[:4]
+    )
+    _set_text(_find_shape(slide, "findings_body"), evidence or _str(d.get("primary_message", "")))
+    positioning = d.get("competitive_context", d.get("key_evidence_statement", ""))
+    se = d.get("supporting_evidence", "")
+    reco = f"{positioning}\n\n{se}" if positioning and se else positioning or se
+    _set_text(_find_shape(slide, "reco_body"), reco or "See evidence section.")
+
+
+def _fill_unmet_needs(slide, d: dict, meta: dict):
+    """Slide 15: 3 challenge/solution pairs."""
+    _set_text(_find_shape(slide, "header_title"),
+              f"Unmet Medical Needs — {meta.get('country','Global')}")
+    needs = d.get("needs", [])
+    challenge_shapes = ["TextBox 20", "TextBox 3", "TextBox 19"]
+    solution_shapes = ["TextBox 11", "TextBox 4", "TextBox 24"]
+    for i in range(3):
+        if i < len(needs):
+            n = needs[i]
+            mag = n.get("magnitude", "")
+            icon = "🔴" if mag == "HIGH" else "🟡" if mag == "MEDIUM" else "🟢"
+            _set_text(_find_shape(slide, challenge_shapes[i]) if i < len(challenge_shapes) else None,
+                      f"{icon} {_str(n.get('title',''))}")
+            _set_text(_find_shape(slide, solution_shapes[i]) if i < len(solution_shapes) else None,
+                      _str(n.get("detail", ""))[:120])
+        else:
+            if i < len(challenge_shapes):
+                _set_text(_find_shape(slide, challenge_shapes[i]), "")
+            if i < len(solution_shapes):
+                _set_text(_find_shape(slide, solution_shapes[i]), "")
+
+
+def _fill_timeline(slide, d: dict, meta: dict):
+    """Slide 16: 6x 'Rounded Rectangle 27' milestones."""
+    _set_text(_find_shape(slide, "header_title"),
+              f"Medical Affairs Roadmap — {meta.get('country','Global')} {meta.get('year','')}")
+    events = d.get("events", [])
+    milestones = _find_shapes_by_name(slide, "Rounded Rectangle 27")
+    for i, ms in enumerate(milestones[:6]):
+        if i < len(events):
+            ev = events[i]
+            _set_text(ms, f"{_str(ev.get('quarter',''))}: {_str(ev.get('event',''))}\n{_str(ev.get('detail',''))}"[:80])
+        else:
+            _set_text(ms, "")
+
+
+def _fill_market_access(slide, d: dict, meta: dict):
+    """Slide 17: Center (TextBox 8/9) + 5 country TextBoxes around it."""
+    _set_text(_find_shape(slide, "header_title"), f"Market Access — {meta.get('country','Global')}")
+    _set_text(_find_shape(slide, "Subtitle 2"), "Regulatory & Reimbursement Status")
+    ap = d.get("approval_status", {})
+    _set_text(_find_shape(slide, "TextBox 8"), meta.get("drug", ""))
+    center = _str(ap.get("national_authority", ap.get("ema", "")))[:80]
+    _set_text(_find_shape(slide, "TextBox 9"), center)
+    country_shapes = ["TextBox 34", "TextBox 22", "TextBox 19", "TextBox 20", "TextBox 21"]
+    country_data = []
+    if ap.get("ema"):
+        country_data.append(f"EMA\n{_str(ap['ema'])[:50]}")
+    if ap.get("fda"):
+        country_data.append(f"FDA\n{_str(ap['fda'])[:50]}")
+    if ap.get("national_authority"):
+        country_data.append(f"{meta.get('country','')}\n{_str(ap['national_authority'])[:50]}")
+    for r in d.get("reimbursement_table", [])[:3]:
+        country_data.append(f"{_str(r.get('body', r.get('country','')))[:20]}\n{_str(r.get('decision', r.get('status','')))[:50]}")
+    for i, cs in enumerate(country_shapes):
+        shape = _find_shape(slide, cs)
+        if shape and i < len(country_data):
+            _set_text(shape, country_data[i])
+        elif shape:
+            _set_text(shape, "")
+
+
+def _fill_swot(slide, d: dict, meta: dict):
+    """Slide 18: Titles stay, fill 4x 'Oval 40' with bullets."""
+    _set_text(_find_shape(slide, "header_title"),
+              f"SWOT Analysis — {meta.get('drug','')} {meta.get('country','Global')}")
+    ovals = _find_shapes_by_name(slide, "Oval 40")
+    for i, key in enumerate(["strengths", "weaknesses", "opportunities", "threats"]):
+        items = d.get(key, [])
+        bullets = "\n".join(f"• {_str(item)[:55]}" for item in items[:5])
+        if i < len(ovals):
+            _set_text(ovals[i], bullets or f"No {key}")
+
+
+def _fill_competitor_table(slide, d: dict, meta: dict):
+    """Slide 19: Fill header + source. Chart/table rendered as extra slides."""
+    _set_text(_find_shape(slide, "header_title"),
+              f"Competitive Landscape — {meta.get('country','Global')} {meta.get('year','')}")
+    _set_text(_find_shape(slide, "source_text"),
+              "Source: EMA EPAR, FDA, NCCN, Published Phase 3 data")
+    rows = d.get("rows", [])
+    focus = [r for r in rows if r.get("is_focus")]
+    if focus:
+        hr = _str(focus[0].get("hr_pfs", ""))
+        if hr:
+            _set_text(_find_shape(slide, "HR Annotation"), f"HR: {hr}")
+
+
+# ══════════════════════════════════════════════════════════
 # Dispatch: section_type → template fill function
+# Covers ALL 20 section types (was 10, now 20)
+# ══════════════════════════════════════════════════════════
 TEMPLATE_FILLERS = {
     "executive_summary": _fill_executive_summary,
+    "disease_intro": _fill_disease_intro,
+    "prevalence_kpi": _fill_prevalence_kpi,
+    "moa": _fill_moa,
+    "pivotal_table": _fill_pivotal_table,
+    "differentiators": _fill_differentiators,
+    "areas_interest": _fill_areas_interest,
+    "iep": _fill_iep,
+    "guidelines": _fill_guidelines,
+    "treatment_algo": _fill_treatment_algo,
     "swot": _fill_swot,
     "strategic_imperatives": _fill_imperatives,
     "imperatives": _fill_imperatives,
@@ -403,8 +689,10 @@ TEMPLATE_FILLERS = {
     "differentiators": _fill_differentiators,
     "competitor_table": _fill_competitor_table,
     "unmet_needs": _fill_unmet_needs,
-    "treatment_algo": _fill_treatment_algo,
-    "guidelines": _fill_guidelines,
+    "tactics": _fill_tactics,
+    "tactical_plan": _fill_tactics,
+    "timeline": _fill_timeline,
+    "market_access": _fill_market_access,
 }
 
 
@@ -424,6 +712,15 @@ PALETTES = {
 }
 
 FONT = "Calibri"
+
+# Slideworks 2025 theme color resolution map
+# Used by _get_text_color_deep to resolve schemeClr references
+SLIDEWORKS_THEME = {
+    "dk1": "000000", "lt1": "FFFFFF", "dk2": "000000", "lt2": "FFFFFF",
+    "tx1": "000000", "tx2": "000000", "bg1": "FFFFFF", "bg2": "FFFFFF",
+    "accent1": "051C2C", "accent2": "22A3DF", "accent3": "2222F6",
+    "accent4": "1877A2", "accent5": "A2D5EC", "accent6": "F8BC3B",
+}
 SLIDE_W = Inches(13.33)
 SLIDE_H = Inches(7.5)
 MX = Inches(0.5)       # left margin
@@ -1472,54 +1769,32 @@ def _render_inplace(tpl_path, meta, ordered, all_refs, P, theme):
         theme_key = _theme_key_from_palette(P)
         
         try:
-            if stype == "treatment_algo":
-                # Overflow table pages (the template has 1 slide, but we may need more)
-                lines = d.get("lines", [])
-                all_regs = []
-                for ln in lines:
-                    for reg in ln.get("regimens", []):
-                        if isinstance(reg, dict):
-                            all_regs.append(reg)
-                        elif isinstance(reg, str):
-                            all_regs.append({"name": reg, "line": ln.get("line","")})
-                if len(all_regs) > 8:
-                    # Need overflow pages — render programmatically
+            if stype == "pivotal_table":
+                # Extra slides for KM curves (per trial beyond the first)
+                trials = d.get("trials", [])
+                active = [t for t in trials if t.get("include_in_map") is not False]
+                if len(active) > 1:
+                    # Template slide handles first trial; render extra trials programmatically
                     overflow_start = len(pres.slides)
-                    render_treatment_algo(pres, d, P, meta)
-                    # The programmatic renderer added slides starting at overflow_start
-                    # We'll include ALL of them (they replace the template slide)
+                    # Skip first trial (already in template), render rest
+                    for tr in active[1:]:
+                        try:
+                            render_pivotal_table(pres, {"trials": [tr], "section_type": "pivotal_table"}, P, meta)
+                        except Exception:
+                            pass
                     extras = list(range(overflow_start, len(pres.slides)))
             
-            elif stype == "pivotal_table":
-                # KM curves + possibly multiple trial slides
-                overflow_start = len(pres.slides)
-                render_pivotal_table(pres, d, P, meta)
-                extras = list(range(overflow_start, len(pres.slides)))
-                # For pivotal, programmatic slides ARE the content (not overflow)
-                # So we DON'T use the template slide
-                used_template_indices.discard(SECTION_TO_SLIDE.get(stype, -1))
-            
             elif stype == "competitor_table":
-                # mPFS chart + ORR chart + table pages
+                # Extra slides: mPFS chart + ORR chart + table pages
                 overflow_start = len(pres.slides)
                 render_competitor_table(pres, d, P, meta)
                 extras = list(range(overflow_start, len(pres.slides)))
-                used_template_indices.discard(SECTION_TO_SLIDE.get(stype, -1))
+                # Keep template slide too (has header + source filled by filler)
             
             elif stype == "subgroup_analysis":
                 overflow_start = len(pres.slides)
                 render_subgroup_analysis(pres, d, P, meta)
                 extras = list(range(overflow_start, len(pres.slides)))
-            
-            elif stype in ("iep", "guidelines", "tactical_plan", "tactics"):
-                # These often produce multiple table pages
-                tpl_idx = SECTION_TO_SLIDE.get(stype)
-                renderer = SECTION_RENDERERS.get(stype)
-                if renderer and tpl_idx is not None:
-                    overflow_start = len(pres.slides)
-                    renderer(pres, d, P, meta)
-                    extras = list(range(overflow_start, len(pres.slides)))
-                    used_template_indices.discard(tpl_idx)
             
             elif stype == "summary":
                 overflow_start = len(pres.slides)
