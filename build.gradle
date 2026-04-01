@@ -25,6 +25,7 @@ dependencies {
     
     // JFreeChart — KM curves, bar charts
     implementation 'org.jfree:jfreechart:1.5.4'
+    implementation 'jakarta.annotation:jakarta.annotation-api:2.1.1'
     
     // Logging
     implementation 'org.slf4j:slf4j-api'
