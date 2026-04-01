@@ -1,1 +1,0 @@
-# MedAI Premium PPTX Renderer
