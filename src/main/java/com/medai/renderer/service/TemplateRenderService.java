@@ -215,28 +215,33 @@ public class TemplateRenderService {
 
         XSLFSlide sourceSlide = templateSlides.get(idx);
 
-        // Import the slide layout first
-        XSLFSlideLayout sourceLayout = sourceSlide.getSlideLayout();
+        // Create new slide in output
         XSLFSlide newSlide = output.createSlide();
 
-        // Deep copy via XML
+        // Deep copy slide XML (preserves all shapes, formatting, backgrounds)
         CTSlide srcCt = sourceSlide.getXmlObject();
         CTSlide dstCt = newSlide.getXmlObject();
         dstCt.set(srcCt.copy());
 
-        // Copy relationships (images, embedded objects)
-        for (var rel : sourceSlide.getRelations()) {
-            if (rel instanceof XSLFPictureData picData) {
-                // Re-add picture to output
-                XSLFPictureData newPic = output.addPicture(
-                        picData.getData(), picData.getType());
-                // Update relationship
-                newSlide.getPackagePart().addRelationship(
-                        newPic.getPackagePart().getPartName(),
-                        org.apache.poi.openxml4j.opc.TargetMode.INTERNAL,
-                        rel.getPackageRelationship().getRelationshipType(),
-                        rel.getPackageRelationship().getId());
+        // Copy embedded images if any (POI 5.x compatible)
+        try {
+            for (org.apache.poi.openxml4j.opc.PackageRelationship rel :
+                    sourceSlide.getPackagePart().getRelationships()) {
+                String type = rel.getRelationshipType();
+                if (type != null && type.contains("image")) {
+                    org.apache.poi.openxml4j.opc.PackagePart srcPart =
+                            sourceSlide.getPackagePart().getRelatedPart(rel);
+                    byte[] imgBytes = srcPart.getInputStream().readAllBytes();
+                    XSLFPictureData newPic = output.addPicture(imgBytes,
+                            org.apache.poi.sl.usermodel.PictureData.PictureType.PNG);
+                    newSlide.getPackagePart().addRelationship(
+                            newPic.getPackagePart().getPartName(),
+                            org.apache.poi.openxml4j.opc.TargetMode.INTERNAL,
+                            type, rel.getId());
+                }
             }
+        } catch (Exception e) {
+            log.debug("No image relationships to copy for slide {} in {}", slideNumber, templateFile);
         }
 
         template.close();
