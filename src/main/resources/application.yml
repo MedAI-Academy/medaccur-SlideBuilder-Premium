@@ -1,0 +1,19 @@
+server:
+  port: ${PORT:8080}
+  servlet:
+    context-path: /
+
+spring:
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 100MB
+
+# Chart Microservice URL (Python/FastAPI on Railway)
+chart-service:
+  url: ${CHART_SERVICE_URL:https://medai-chart-service-production.up.railway.app}
+
+logging:
+  level:
+    com.medaccur: INFO
+    org.apache.poi: WARN
