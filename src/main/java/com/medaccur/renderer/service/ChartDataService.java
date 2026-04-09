@@ -2,13 +2,11 @@ package com.medaccur.renderer.service;
 
 import org.apache.poi.ooxml.POIXMLDocumentPart;
 import org.apache.poi.xslf.usermodel.*;
-import org.apache.poi.xssf.usermodel.*;
 import org.openxmlformats.schemas.drawingml.x2006.chart.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
-import java.io.OutputStream;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -16,20 +14,18 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Updates embedded Excel chart data in PowerPoint slides/layouts.
+ * Updates embedded chart data in PowerPoint layouts/slides.
  * Finds charts by alt-text name (CHART_MEDIAN_PFS, CHART_ORR_RESPONSE_DRUG, etc.)
  *
- * ALWAYS updates BOTH:
- * 1. Embedded Excel workbook (source of truth)
- * 2. XML numCache/strCache (what PowerPoint renders immediately)
+ * v3.2 STRATEGY: Update ONLY the XML cache (numCache/strCache) — NOT the
+ * embedded Excel workbook. POI's workbook write-back corrupts the xlsx
+ * structure, causing PowerPoint's "repair" popup and black/empty charts.
  *
- * CRITICAL FIX (v3.1): After modifying the XSSFWorkbook, we MUST write it
- * back to the chart's embedded package part. Without this, the PPTX file
- * still contains the original Excel data and PowerPoint shows old values.
+ * The XML cache is what PowerPoint renders on open. The Excel is only used
+ * when double-clicking a chart to edit — acceptable for generated decks.
  *
- * ARCHITECTURE (v3.1): Charts live on LAYOUTS, not slides. We update them
- * on the layout BEFORE creating the slide. The slide inherits the updated
- * chart via PowerPoint's visual inheritance — no XML copying needed.
+ * Charts live on LAYOUTS. We update them BEFORE creating the slide.
+ * The slide inherits the updated chart via visual inheritance.
  */
 @Service
 public class ChartDataService {
@@ -38,22 +34,10 @@ public class ChartDataService {
     private static final Pattern ALT_TEXT = Pattern.compile("descr=\"([^\"]*)\"");
     private static final Pattern REL_ID = Pattern.compile("r:id=\"([^\"]*)\"");
 
-    /**
-     * Update all charts on a sheet (slide or layout) based on chartData map.
-     * Works on both XSLFSlide and XSLFSlideLayout (both extend XSLFSheet).
-     *
-     * chartData format:
-     * {
-     *   "CHART_MEDIAN_PFS": {
-     *     "rows": [{"label":"SVd", "value": 13.9}, {"label":"Vd", "value": 9.4}]
-     *   }
-     * }
-     */
     @SuppressWarnings("unchecked")
     public void updateAllCharts(XSLFSheet sheet, Map<String, Object> chartData) {
         if (chartData == null || chartData.isEmpty()) return;
 
-        // Build map of relId → XSLFChart from this sheet's relations
         Map<String, XSLFChart> chartsByRelId = new HashMap<>();
         for (POIXMLDocumentPart.RelationPart rp : sheet.getRelationParts()) {
             if (rp.getDocumentPart() instanceof XSLFChart) {
@@ -65,10 +49,8 @@ public class ChartDataService {
             log.debug("No charts found on sheet");
             return;
         }
-        log.info("Found {} chart(s) on sheet, checking against {} chartData key(s)",
-                 chartsByRelId.size(), chartData.size());
+        log.info("Found {} chart(s), checking against {} key(s)", chartsByRelId.size(), chartData.size());
 
-        // Iterate shapes to find graphicFrames with matching alt-text
         for (XSLFShape shape : sheet.getShapes()) {
             if (!(shape instanceof XSLFGraphicFrame)) continue;
 
@@ -78,16 +60,15 @@ public class ChartDataService {
             Object data = chartData.get(altText);
             if (data == null) continue;
 
-            // Extract the relationship ID from the graphicFrame XML (c:chart r:id="rIdX")
             String relId = extractChartRelId(shape);
             if (relId == null) {
-                log.warn("Chart shape '{}' has no r:id — skipping", altText);
+                log.warn("Chart '{}' has no r:id", altText);
                 continue;
             }
 
             XSLFChart chart = chartsByRelId.get(relId);
             if (chart == null) {
-                log.warn("No chart part found for relId '{}' (shape '{}')", relId, altText);
+                log.warn("No chart for relId '{}' ('{}')", relId, altText);
                 continue;
             }
 
@@ -96,281 +77,100 @@ public class ChartDataService {
             if (rows == null || rows.isEmpty()) continue;
 
             try {
-                // Step 1: Update embedded Excel workbook
-                XSSFWorkbook wb = chart.getWorkbook();
-                XSSFSheet excelSheet = wb.getSheetAt(0);
-                updateExcel(excelSheet, rows);
-
-                // Step 2: CRITICAL — Write workbook back to package part!
-                // Without this, the PPTX contains the ORIGINAL Excel data.
-                writeBackWorkbook(chart, wb);
-
-                // Step 3: Update XML cache (what PowerPoint renders immediately)
                 updateXmlCache(chart, rows);
-
-                // Step 4: Auto-scale Y-axis
-                autoScaleAxis(chart, rows, chartSpec);
-
-                log.info("Chart '{}' updated: {} rows (relId={})", altText, rows.size(), relId);
-
+                log.info("Chart '{}' cache updated: {} rows", altText, rows.size());
             } catch (Exception e) {
-                log.error("Chart '{}' update failed: {}", altText, e.getMessage(), e);
+                log.error("Chart '{}' failed: {}", altText, e.getMessage(), e);
             }
         }
     }
-
-    // ════════════════════════════════════════════════
-    // WORKBOOK WRITE-BACK (the critical missing piece)
-    // ════════════════════════════════════════════════
-
-    /**
-     * Write the modified XSSFWorkbook back to the chart's embedded package part.
-     *
-     * This is the fix that Gemini correctly identified: POI reads the embedded
-     * Excel into memory as an XSSFWorkbook, but modifying it doesn't automatically
-     * persist the changes. We must explicitly write it back to the package part's
-     * OutputStream so the PPTX file contains the updated data.
-     */
-    private void writeBackWorkbook(XSLFChart chart, XSSFWorkbook wb) {
-        try {
-            // Find the embedded workbook part among the chart's relations
-            for (POIXMLDocumentPart.RelationPart rp : chart.getRelationParts()) {
-                String contentType = rp.getDocumentPart().getPackagePart().getContentType();
-                if (contentType.contains("spreadsheetml") || contentType.contains("excel")) {
-                    try (OutputStream os = rp.getDocumentPart().getPackagePart().getOutputStream()) {
-                        wb.write(os);
-                        log.debug("  Workbook written back to package part");
-                        return;
-                    }
-                }
-            }
-            // Fallback: try writing to chart's own package part output
-            log.warn("  No separate workbook part found — trying chart part directly");
-        } catch (Exception e) {
-            log.error("  Workbook write-back failed: {}", e.getMessage());
-        }
-    }
-
-    // ════════════════════════════════════════════════
-    // EXCEL UPDATE
-    // ════════════════════════════════════════════════
-
-    private void updateExcel(XSSFSheet sheet, List<Map<String, Object>> rows) {
-        for (int i = 0; i < rows.size(); i++) {
-            XSSFRow row = sheet.getRow(i + 1);
-            if (row == null) row = sheet.createRow(i + 1);
-            Map<String, Object> data = rows.get(i);
-
-            setCell(row, 0, data.get("label"));
-            setCell(row, 1, data.get("value"));
-            if (data.containsKey("value2")) setCell(row, 2, data.get("value2"));
-        }
-
-        // Clear excess rows
-        for (int i = rows.size() + 1; i <= 12; i++) {
-            XSSFRow row = sheet.getRow(i);
-            if (row == null) continue;
-            for (int c = 0; c < 3; c++) {
-                XSSFCell cell = row.getCell(c);
-                if (cell != null) {
-                    if (c == 0) cell.setCellValue("");
-                    else cell.setCellValue(0);
-                }
-            }
-        }
-    }
-
-    // ════════════════════════════════════════════════
-    // XML CACHE + RANGE SYNC
-    // ════════════════════════════════════════════════
 
     private void updateXmlCache(XSLFChart chart, List<Map<String, Object>> rows) {
-        try {
-            CTChart ctChart = chart.getCTChart();
-            CTPlotArea plotArea = ctChart.getPlotArea();
+        CTChart ctChart = chart.getCTChart();
+        CTPlotArea plotArea = ctChart.getPlotArea();
 
-            for (int ci = 0; ci < plotArea.sizeOfBarChartArray(); ci++) {
-                CTBarChart barChart = plotArea.getBarChartArray(ci);
-                updateBarChartCache(barChart, rows);
-            }
-
-            for (int ci = 0; ci < plotArea.sizeOfLineChartArray(); ci++) {
-                // Line chart — similar pattern
-            }
-
-            for (int ci = 0; ci < plotArea.sizeOfPieChartArray(); ci++) {
-                // Pie chart — similar pattern
-            }
-
-            for (int ci = 0; ci < plotArea.sizeOfScatterChartArray(); ci++) {
-                // Scatter chart (future: KM curves if embedded)
-            }
-
-        } catch (Exception e) {
-            log.warn("XML cache sync partial failure: {}", e.getMessage());
+        for (int ci = 0; ci < plotArea.sizeOfBarChartArray(); ci++) {
+            updateBarChart(plotArea.getBarChartArray(ci), rows);
+        }
+        for (int ci = 0; ci < plotArea.sizeOfLineChartArray(); ci++) {
+            CTLineSer[] s = plotArea.getLineChartArray(ci).getSerArray();
+            if (s.length > 0) updateGenericSeries(s[0].getCat(), s[0].getVal(), rows, "value");
+        }
+        for (int ci = 0; ci < plotArea.sizeOfPieChartArray(); ci++) {
+            CTPieSer[] s = plotArea.getPieChartArray(ci).getSerArray();
+            if (s.length > 0) updateGenericSeries(s[0].getCat(), s[0].getVal(), rows, "value");
         }
     }
 
-    private void updateBarChartCache(CTBarChart barChart, List<Map<String, Object>> rows) {
+    private void updateBarChart(CTBarChart barChart, List<Map<String, Object>> rows) {
         CTBarSer[] series = barChart.getSerArray();
         if (series.length == 0) return;
 
-        // Update first series values
-        if (series[0].getVal() != null && series[0].getVal().getNumRef() != null) {
-            CTNumRef numRef = series[0].getVal().getNumRef();
-            numRef.setF("Sheet1!$B$2:$B$" + (rows.size() + 1));
-            if (numRef.getNumCache() != null) {
-                syncNumCache(numRef.getNumCache(), rows, "value");
-            }
-        }
-
-        // Update category labels
+        // Categories (shared)
         if (series[0].getCat() != null && series[0].getCat().getStrRef() != null) {
-            CTStrRef strRef = series[0].getCat().getStrRef();
-            strRef.setF("Sheet1!$A$2:$A$" + (rows.size() + 1));
-            if (strRef.getStrCache() != null) {
-                syncStrCache(strRef.getStrCache(), rows, "label");
-            }
+            CTStrRef sr = series[0].getCat().getStrRef();
+            sr.setF("Sheet1!$A$2:$A$" + (rows.size() + 1));
+            if (sr.getStrCache() != null) syncStr(sr.getStrCache(), rows, "label");
         }
 
-        // Update second series if exists
-        if (series.length > 1 && rows.get(0).containsKey("value2")) {
+        // Series 1
+        if (series[0].getVal() != null && series[0].getVal().getNumRef() != null) {
+            CTNumRef nr = series[0].getVal().getNumRef();
+            nr.setF("Sheet1!$B$2:$B$" + (rows.size() + 1));
+            if (nr.getNumCache() != null) syncNum(nr.getNumCache(), rows, "value");
+        }
+
+        // Series 2
+        if (series.length > 1 && rows.size() > 0 && rows.get(0).containsKey("value2")) {
             if (series[1].getVal() != null && series[1].getVal().getNumRef() != null) {
-                CTNumRef numRef = series[1].getVal().getNumRef();
-                numRef.setF("Sheet1!$C$2:$C$" + (rows.size() + 1));
-                if (numRef.getNumCache() != null) {
-                    syncNumCache(numRef.getNumCache(), rows, "value2");
-                }
+                CTNumRef nr = series[1].getVal().getNumRef();
+                nr.setF("Sheet1!$C$2:$C$" + (rows.size() + 1));
+                if (nr.getNumCache() != null) syncNum(nr.getNumCache(), rows, "value2");
             }
         }
     }
 
-    private void syncNumCache(CTNumData cache, List<Map<String, Object>> rows, String key) {
+    private void updateGenericSeries(CTAxDataSource cat, CTNumDataSource val,
+                                      List<Map<String, Object>> rows, String key) {
+        if (cat != null && cat.getStrRef() != null) {
+            cat.getStrRef().setF("Sheet1!$A$2:$A$" + (rows.size() + 1));
+            if (cat.getStrRef().getStrCache() != null) syncStr(cat.getStrRef().getStrCache(), rows, "label");
+        }
+        if (val != null && val.getNumRef() != null) {
+            val.getNumRef().setF("Sheet1!$B$2:$B$" + (rows.size() + 1));
+            if (val.getNumRef().getNumCache() != null) syncNum(val.getNumRef().getNumCache(), rows, key);
+        }
+    }
+
+    private void syncNum(CTNumData cache, List<Map<String, Object>> rows, String key) {
         cache.getPtCount().setVal(rows.size());
-        while (cache.sizeOfPtArray() < rows.size()) {
-            CTNumVal pt = cache.addNewPt();
-            pt.setIdx(cache.sizeOfPtArray() - 1);
-            pt.setV("0");
-        }
-        while (cache.sizeOfPtArray() > rows.size()) {
-            cache.removePt(cache.sizeOfPtArray() - 1);
-        }
+        while (cache.sizeOfPtArray() < rows.size()) { CTNumVal p = cache.addNewPt(); p.setIdx(cache.sizeOfPtArray()-1); p.setV("0"); }
+        while (cache.sizeOfPtArray() > rows.size()) cache.removePt(cache.sizeOfPtArray()-1);
         for (int i = 0; i < rows.size(); i++) {
-            CTNumVal pt = cache.getPtArray(i);
-            pt.setIdx(i);
-            Object val = rows.get(i).get(key);
-            pt.setV(val instanceof Number ? String.valueOf(((Number) val).doubleValue()) : "0");
+            cache.getPtArray(i).setIdx(i);
+            Object v = rows.get(i).get(key);
+            cache.getPtArray(i).setV(v instanceof Number ? String.valueOf(((Number)v).doubleValue()) : "0");
         }
     }
 
-    private void syncStrCache(CTStrData cache, List<Map<String, Object>> rows, String key) {
+    private void syncStr(CTStrData cache, List<Map<String, Object>> rows, String key) {
         cache.getPtCount().setVal(rows.size());
-        while (cache.sizeOfPtArray() < rows.size()) {
-            CTStrVal pt = cache.addNewPt();
-            pt.setIdx(cache.sizeOfPtArray() - 1);
-            pt.setV("");
-        }
-        while (cache.sizeOfPtArray() > rows.size()) {
-            cache.removePt(cache.sizeOfPtArray() - 1);
-        }
+        while (cache.sizeOfPtArray() < rows.size()) { CTStrVal p = cache.addNewPt(); p.setIdx(cache.sizeOfPtArray()-1); p.setV(""); }
+        while (cache.sizeOfPtArray() > rows.size()) cache.removePt(cache.sizeOfPtArray()-1);
         for (int i = 0; i < rows.size(); i++) {
-            CTStrVal pt = cache.getPtArray(i);
-            pt.setIdx(i);
-            String val = (String) rows.get(i).get(key);
-            pt.setV(val != null ? val : "");
+            cache.getPtArray(i).setIdx(i);
+            String v = (String) rows.get(i).get(key);
+            cache.getPtArray(i).setV(v != null ? v : "");
         }
     }
-
-    // ════════════════════════════════════════════════
-    // AUTO-SCALE Y-AXIS
-    // ════════════════════════════════════════════════
-
-    private void autoScaleAxis(XSLFChart chart, List<Map<String, Object>> rows,
-                                Map<String, Object> spec) {
-        try {
-            CTChart ctChart = chart.getCTChart();
-            CTPlotArea plotArea = ctChart.getPlotArea();
-            if (plotArea.sizeOfValAxArray() == 0) return;
-
-            CTValAx valAx = plotArea.getValAxArray(0);
-            CTScaling scaling = valAx.getScaling();
-
-            Object explicitMax = spec.get("y_max");
-            if (explicitMax != null) {
-                scaling.getMax().setVal(((Number) explicitMax).doubleValue());
-                return;
-            }
-
-            double maxVal = rows.stream()
-                .mapToDouble(r -> {
-                    Object v = r.get("value");
-                    return v instanceof Number ? ((Number) v).doubleValue() : 0;
-                })
-                .max().orElse(10);
-
-            if (maxVal <= 1.5) {
-                scaling.getMin().setVal(0);
-                scaling.getMax().setVal(Math.ceil(maxVal * 5) / 5.0);
-            } else if (maxVal <= 100) {
-                scaling.getMin().setVal(0);
-                double nice = niceRound(maxVal * 1.15);
-                scaling.getMax().setVal(nice);
-            }
-
-        } catch (Exception e) {
-            log.debug("Y-axis auto-scale skipped: {}", e.getMessage());
-        }
-    }
-
-    // ════════════════════════════════════════════════
-    // HELPERS
-    // ════════════════════════════════════════════════
 
     private String extractAltText(XSLFShape shape) {
-        try {
-            String xml = shape.getXmlObject().toString();
-            Matcher m = ALT_TEXT.matcher(xml);
-            if (m.find()) return m.group(1);
-        } catch (Exception e) { /* ignore */ }
+        try { Matcher m = ALT_TEXT.matcher(shape.getXmlObject().toString()); if (m.find()) return m.group(1); } catch (Exception e) {}
         return "";
     }
 
-    /**
-     * Extract the chart relationship ID (r:id) from a graphicFrame's XML.
-     * The chart reference looks like: <c:chart r:id="rId2"/>
-     */
     private String extractChartRelId(XSLFShape shape) {
-        try {
-            String xml = shape.getXmlObject().toString();
-            // Look for the chart namespace reference with r:id
-            if (xml.contains("chart") && xml.contains("r:id")) {
-                Matcher m = REL_ID.matcher(xml);
-                if (m.find()) return m.group(1);
-            }
-        } catch (Exception e) { /* ignore */ }
+        try { String x = shape.getXmlObject().toString(); if (x.contains("chart")) { Matcher m = REL_ID.matcher(x); if (m.find()) return m.group(1); } } catch (Exception e) {}
         return null;
-    }
-
-    private void setCell(XSSFRow row, int col, Object value) {
-        XSSFCell cell = row.getCell(col);
-        if (cell == null) cell = row.createCell(col);
-        if (value instanceof Number) {
-            cell.setCellValue(((Number) value).doubleValue());
-        } else if (value instanceof String) {
-            cell.setCellValue((String) value);
-        } else {
-            cell.setCellValue(value != null ? value.toString() : "");
-        }
-    }
-
-    private double niceRound(double val) {
-        if (val <= 0) return 1;
-        double mag = Math.pow(10, Math.floor(Math.log10(val)));
-        double norm = val / mag;
-        if (norm <= 1.5) return 1.5 * mag;
-        if (norm <= 2) return 2 * mag;
-        if (norm <= 3) return 3 * mag;
-        if (norm <= 5) return 5 * mag;
-        return 10 * mag;
     }
 }
