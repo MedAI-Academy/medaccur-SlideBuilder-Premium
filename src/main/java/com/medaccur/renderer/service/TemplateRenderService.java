@@ -2,9 +2,6 @@ package com.medaccur.renderer.service;
 
 import com.medaccur.renderer.model.RenderRequest;
 import com.medaccur.renderer.model.SlideSpec;
-import org.apache.poi.ooxml.POIXMLDocumentPart;
-import org.apache.poi.openxml4j.opc.PackageRelationship;
-import org.apache.poi.openxml4j.opc.TargetMode;
 import org.apache.poi.openxml4j.util.ZipSecureFile;
 import org.apache.poi.xslf.usermodel.*;
 import org.openxmlformats.schemas.presentationml.x2006.main.CTGroupShape;
@@ -116,10 +113,18 @@ public class TemplateRenderService {
                 continue;
             }
 
-            // Create slide from layout (inherits design but shapes are empty)
+            // CHART FIX: Update embedded chart data on the LAYOUT BEFORE creating
+            // the slide. Charts live on the layout level — POI's API can find them
+            // there. The slide inherits the updated chart via visual inheritance.
+            if (spec.hasChartData()) {
+                chartDataService.updateAllCharts(layout, spec.getChartData());
+            }
+
+            // Create slide from layout (inherits design + updated charts)
             XSLFSlide slide = pptx.createSlide(layout);
 
-            // CRITICAL FIX: Copy all shapes from layout to slide level via XML
+            // Copy text shapes from layout to slide level via XML
+            // (skip graphicFrame + pic — charts stay on layout for inheritance)
             int imported = importLayoutShapesToSlide(slide, layout);
             log.info("  {} shapes imported from layout to slide", imported);
 
@@ -152,12 +157,8 @@ public class TemplateRenderService {
             int cleaned = placeholderService.removeUnfilledPlaceholders(slide);
             if (cleaned > 0) log.info("  Slide {}: {} unfilled placeholders removed", i + 1, cleaned);
 
-            // Step 3: Update embedded chart data
-            if (spec.hasChartData()) {
-                chartDataService.updateAllCharts(slide, spec.getChartData());
-            }
-
-            // Step 4: Insert figure PNGs (KM curves, Forest plots)
+            // Step 3: Insert figure PNGs (KM curves, Forest plots)
+            // (Charts already updated on layout in Pass 1)
             if (spec.hasFigure()) {
                 figureService.insertFigure(slide, spec.getFigurePng());
             }
@@ -186,23 +187,11 @@ public class TemplateRenderService {
     // ════════════════════════════════════════════════════════════
 
     /**
-     * Deep-copy all shapes from a layout's XML spTree to the slide's XML spTree.
+     * Deep-copy text shapes from a layout's XML spTree to the slide's XML spTree.
      *
-     * When Apache POI creates a slide via createSlide(layout), the slide is EMPTY.
-     * Layout shapes are only "inherited" visually — they're not on the slide and
-     * therefore NOT accessible via slide.getShapes(). This means PlaceholderService
-     * can never find or replace {{placeholders}}, and ChartDataService can never
-     * find embedded charts to update their Excel data.
-     *
-     * This method copies ALL shape types:
-     * - sp       (TextBoxes, AutoShapes — contain {{placeholders}})
-     * - grpSp    (Group shapes — may contain nested text)
-     * - cxnSp    (Connectors)
-     * - graphicFrame (Embedded Excel charts — need relationship copy!)
-     * - pic      (Embedded images — need relationship copy!)
-     *
-     * For graphicFrame and pic, we also copy the OPC relationships from the
-     * layout part to the slide part so that chart/image references resolve.
+     * Copies: sp, grpSp, cxnSp (contain {{placeholders}} and decorative shapes)
+     * SKIPS: graphicFrame (charts stay on layout — updated there, inherited visually)
+     * SKIPS: pic (images stay on layout — inherited visually)
      *
      * @return number of shapes imported
      */
@@ -212,40 +201,24 @@ public class TemplateRenderService {
             CTGroupShape layoutTree = layout.getXmlObject().getCSld().getSpTree();
             CTGroupShape slideTree = slide.getXmlObject().getCSld().getSpTree();
 
-            // Copy sp elements (TextBoxes, AutoShapes with {{placeholders}})
             for (int i = 0; i < layoutTree.sizeOfSpArray(); i++) {
                 slideTree.addNewSp().set(layoutTree.getSpArray(i).copy());
                 count++;
             }
 
-            // Copy group shapes (may contain nested TextBoxes)
             for (int i = 0; i < layoutTree.sizeOfGrpSpArray(); i++) {
                 slideTree.addNewGrpSp().set(layoutTree.getGrpSpArray(i).copy());
                 count++;
             }
 
-            // Copy connector shapes
             for (int i = 0; i < layoutTree.sizeOfCxnSpArray(); i++) {
                 slideTree.addNewCxnSp().set(layoutTree.getCxnSpArray(i).copy());
                 count++;
             }
 
-            // Copy graphicFrame elements (embedded Excel charts, tables)
-            for (int i = 0; i < layoutTree.sizeOfGraphicFrameArray(); i++) {
-                slideTree.addNewGraphicFrame().set(layoutTree.getGraphicFrameArray(i).copy());
-                count++;
-            }
-
-            // Copy pic elements (embedded images, logos)
-            for (int i = 0; i < layoutTree.sizeOfPicArray(); i++) {
-                slideTree.addNewPic().set(layoutTree.getPicArray(i).copy());
-                count++;
-            }
-
-            // Copy ALL relationships from layout to slide (charts, images, etc.)
-            // GraphicFrame/pic XML contains r:id="rIdX" references that must resolve
-            // on the slide part, not just the layout part.
-            copyRelationships(layout, slide);
+            // graphicFrame (charts) and pic (images) stay on layout:
+            // - Charts: updated on layout in Pass 1, inherited visually
+            // - Images: inherited visually from layout (no modification needed)
 
         } catch (Exception e) {
             log.error("Shape import failed: {}", e.getMessage(), e);
@@ -254,46 +227,10 @@ public class TemplateRenderService {
     }
 
     /**
-     * Copy OPC package relationships from layout to slide.
-     * This ensures that r:id references in copied graphicFrame/pic XML
-     * resolve correctly on the slide part.
-     *
-     * Copies: chart relations, image relations, and any other embedded parts.
-     */
-    private void copyRelationships(XSLFSlideLayout layout, XSLFSlide slide) {
-        try {
-            for (POIXMLDocumentPart.RelationPart rp : layout.getRelationParts()) {
-                POIXMLDocumentPart part = rp.getDocumentPart();
-                PackageRelationship rel = rp.getRelationship();
-                String relId = rel.getId();
-
-                // Skip if this relationship already exists on the slide
-                try {
-                    if (slide.getPackagePart().getRelationship(relId) != null) continue;
-                } catch (Exception ignore) {}
-
-                // Copy the relationship: same ID, same target, same type
-                slide.getPackagePart().addRelationship(
-                    part.getPackagePart().getPartName(),
-                    TargetMode.INTERNAL,
-                    rel.getRelationshipType(),
-                    relId
-                );
-                log.debug("  Copied relationship {} → {} ({})",
-                    relId, part.getPackagePart().getPartName(), 
-                    part.getClass().getSimpleName());
-            }
-        } catch (Exception e) {
-            log.warn("Relationship copy partial failure: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * Clear all shapes from a layout's spTree after they've been copied to slides.
-     * This prevents visual duplication (layout shapes showing behind slide shapes).
+     * Clear text shapes from a layout's spTree after they've been copied to slides.
+     * Keeps graphicFrame (charts) and pic (images) for visual inheritance.
      *
      * SAFE because we work on a FRESH COPY of the template per render.
-     * The original template file is never modified.
      */
     private void clearLayoutShapes(XSLFSlideLayout layout) {
         try {
@@ -302,8 +239,9 @@ public class TemplateRenderService {
             while (tree.sizeOfSpArray() > 0) tree.removeSp(0);
             while (tree.sizeOfGrpSpArray() > 0) tree.removeGrpSp(0);
             while (tree.sizeOfCxnSpArray() > 0) tree.removeCxnSp(0);
-            while (tree.sizeOfGraphicFrameArray() > 0) tree.removeGraphicFrame(0);
-            while (tree.sizeOfPicArray() > 0) tree.removePic(0);
+
+            // KEEP graphicFrame (charts with updated data) and pic (images)
+            // They remain on the layout and are inherited visually by the slide.
 
         } catch (Exception e) {
             log.error("Layout shape clear failed: {}", e.getMessage(), e);
