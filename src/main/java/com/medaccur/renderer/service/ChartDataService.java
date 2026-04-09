@@ -9,26 +9,23 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.*;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.*;
 
 /**
- * Updates chart data via raw xlsx ZIP editing + XML cache update.
+ * v3.6: Raw xlsx ZIP edit with INLINE strings (bypass sharedStrings entirely)
+ * + XML cache update + chart-to-slide migration support.
  *
- * v3.5 STRATEGY:
- *   1. Raw-edit embedded xlsx: ONLY change numeric values in sheet1.xml
- *      (SharedStrings are NOT touched — avoids the SharedStrings trap)
- *   2. Update chart XML cache: labels (strCache) + values (numCache)
- *      PowerPoint reads labels from cache, numbers from Excel.
+ * Strategy:
+ * 1. Raw-edit embedded xlsx: numbers in sheet1.xml, labels as inlineStr
+ * 2. Update chart XML cache for immediate rendering
+ * 3. Both Excel AND cache show correct data → PowerPoint is consistent
  *
- * Why this works:
- * - Previous tests proved: PPT renders LABELS from XML cache, NUMBERS from Excel
- * - So we change numbers in Excel (raw ZIP edit) and labels in cache (XML API)
- * - No XSSFWorkbook.write() — the xlsx structure stays byte-identical
- * - Only the <v>NUMBER</v> values inside B-column cells change
+ * Key change from v3.5: Labels use <c t="inlineStr"><is><t>SVd</t></is></c>
+ * instead of shared string references. This bypasses the fragile sharedStrings
+ * rebuild that failed for ORR Control charts.
  */
 @Service
 public class ChartDataService {
@@ -36,9 +33,6 @@ public class ChartDataService {
     private static final Logger log = LoggerFactory.getLogger(ChartDataService.class);
     private static final Pattern ALT_TEXT_PAT = Pattern.compile("descr=\"([^\"]*)\"");
     private static final Pattern REL_ID_PAT = Pattern.compile("r:id=\"([^\"]*)\"");
-    // Matches <c r="B2"><v>45</v></c> or <c r="B2" s="1"><v>45</v></c>
-    private static final Pattern BCELL_PAT = Pattern.compile(
-        "(<c r=\"B)(\\d+)(\"[^>]*><v>)([^<]*)(</v></c>)");
 
     @SuppressWarnings("unchecked")
     public void updateAllCharts(XSLFSheet sheet, Map<String, Object> chartData) {
@@ -66,18 +60,14 @@ public class ChartDataService {
 
         for (XSLFShape shape : sheet.getShapes()) {
             if (!(shape instanceof XSLFGraphicFrame)) continue;
-
             String altText = extractAltText(shape);
             if (altText.isEmpty()) continue;
-
             Object data = chartData.get(altText);
             if (data == null) continue;
-
             String relId = extractChartRelId(shape);
             if (relId == null) continue;
-
             XSLFChart chart = chartsByRelId.get(relId);
-            PackagePart xlsxPart = xlsxParts.get(relId);
+            PackagePart xlsx = xlsxParts.get(relId);
             if (chart == null) continue;
 
             Map<String, Object> spec = (Map<String, Object>) data;
@@ -85,16 +75,12 @@ public class ChartDataService {
             if (rows == null || rows.isEmpty()) continue;
 
             try {
-                // Step 1: Raw-edit ONLY numeric values in embedded xlsx
-                if (xlsxPart != null) {
-                    editXlsxNumbers(xlsxPart, rows);
-                    log.info("Chart '{}': xlsx numbers updated", altText);
+                if (xlsx != null) {
+                    rawEditXlsx(xlsx, rows);
+                    log.info("Chart '{}': xlsx updated", altText);
                 }
-
-                // Step 2: Update XML cache (labels + values)
                 updateXmlCache(chart, rows);
                 log.info("Chart '{}': cache updated ({} rows)", altText, rows.size());
-
             } catch (Exception e) {
                 log.error("Chart '{}' failed: {}", altText, e.getMessage(), e);
             }
@@ -102,52 +88,31 @@ public class ChartDataService {
     }
 
     // ════════════════════════════════════════════════
-    // RAW XLSX NUMBER EDITING
+    // RAW XLSX EDIT
     // ════════════════════════════════════════════════
 
-    /**
-     * Edit ONLY the numeric values in column B of sheet1.xml.
-     * SharedStrings, styles, theme, rels — everything else untouched.
-     *
-     * Reads xlsx as ZIP, modifies sheet1.xml, writes ZIP back.
-     * The xlsx structure is preserved byte-for-byte except for
-     * the <v>NUMBER</v> content in B-column cells.
-     */
-    private void editXlsxNumbers(PackagePart xlsxPart, List<Map<String, Object>> rows) throws Exception {
-        // Read xlsx bytes
-        byte[] xlsxBytes;
+    private void rawEditXlsx(PackagePart xlsxPart, List<Map<String, Object>> rows) throws Exception {
+        byte[] original;
         try (InputStream is = xlsxPart.getInputStream()) {
-            xlsxBytes = is.readAllBytes();
+            original = is.readAllBytes();
         }
 
-        // Build value map: row number → new value
-        // Row 2 = first data row, Row 3 = second, etc.
-        Map<Integer, Double> newValues = new HashMap<>();
-        for (int i = 0; i < rows.size(); i++) {
-            Object v = rows.get(i).get("value");
-            double val = (v instanceof Number) ? ((Number) v).doubleValue() : 0.0;
-            newValues.put(i + 2, val); // Excel row numbers start at 2 for data
-        }
-
-        // Process ZIP: only modify sheet1.xml
-        ByteArrayOutputStream modifiedZip = new ByteArrayOutputStream();
-        try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(xlsxBytes));
-             ZipOutputStream zos = new ZipOutputStream(modifiedZip)) {
+        ByteArrayOutputStream modified = new ByteArrayOutputStream();
+        try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(original));
+             ZipOutputStream zos = new ZipOutputStream(modified)) {
 
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
                 byte[] content = zis.readAllBytes();
                 String name = entry.getName();
 
-                // Only modify sheet1.xml
                 if (name.endsWith("/sheet1.xml") && name.contains("worksheets")) {
-                    String sheetXml = new String(content, StandardCharsets.UTF_8);
-                    sheetXml = replaceBColumnValues(sheetXml, newValues);
-                    content = sheetXml.getBytes(StandardCharsets.UTF_8);
-                    log.debug("  sheet1.xml: replaced {} B-column values", newValues.size());
+                    content = buildSheetXml(content, rows);
+                } else if (name.contains("tables/table") && name.endsWith(".xml")) {
+                    content = updateTableRange(content, rows.size());
                 }
+                // sharedStrings.xml: leave untouched — we use inlineStr now
 
-                // Write entry (preserve original name, use DEFLATED)
                 ZipEntry newEntry = new ZipEntry(name);
                 zos.putNextEntry(newEntry);
                 zos.write(content);
@@ -155,35 +120,85 @@ public class ChartDataService {
             }
         }
 
-        // Write modified xlsx back
         try (OutputStream os = xlsxPart.getOutputStream()) {
-            os.write(modifiedZip.toByteArray());
+            os.write(modified.toByteArray());
         }
     }
 
     /**
-     * Replace numeric values in B-column cells of sheet1.xml.
-     *
-     * Matches: <c r="B2"><v>45</v></c>  or  <c r="B2" s="1"><v>45</v></c>
-     * Replaces: <c r="B2"><v>13.9</v></c>  (preserves all attributes)
-     *
-     * Only changes <v>VALUE</v>, everything else (attributes, namespaces) untouched.
+     * Build new sheet1.xml with inline string labels and numeric values.
+     * Uses <c t="inlineStr"><is><t>LABEL</t></is></c> for labels —
+     * this bypasses sharedStrings entirely and works reliably.
      */
-    private String replaceBColumnValues(String sheetXml, Map<Integer, Double> newValues) {
-        Matcher m = BCELL_PAT.matcher(sheetXml);
-        StringBuffer sb = new StringBuffer();
+    private byte[] buildSheetXml(byte[] original, List<Map<String, Object>> rows) {
+        String xml = new String(original, java.nio.charset.StandardCharsets.UTF_8);
 
-        while (m.find()) {
-            int rowNum = Integer.parseInt(m.group(2));
-            Double newVal = newValues.get(rowNum);
-            if (newVal != null) {
-                // Replace value, preserve everything else
-                m.appendReplacement(sb, "$1$2$3" + newVal.toString() + "$5");
+        // Extract the part before sheetData and after sheetData
+        int sdStart = xml.indexOf("<sheetData>");
+        int sdEnd = xml.indexOf("</sheetData>") + "</sheetData>".length();
+        if (sdStart < 0 || sdEnd < 0) return original;
+
+        String before = xml.substring(0, sdStart);
+        String after = xml.substring(sdEnd);
+
+        // Update dimension
+        int lastRow = rows.size() + 1;
+        before = before.replaceFirst("ref=\"[^\"]+\"", "ref=\"A1:B" + lastRow + "\"");
+
+        // Extract header series name from original row 1 col B
+        // (e.g. "mPFS", "DRUG", "Series 1")
+        String seriesName = "Series";
+        Pattern headerPat = Pattern.compile("<row r=\"1\"[^>]*>.*?</row>", Pattern.DOTALL);
+        Matcher hm = headerPat.matcher(xml);
+        if (hm.find()) {
+            String headerRow = hm.group();
+            // Look for the B1 cell value — could be shared string ref or inline
+            Pattern b1Val = Pattern.compile("<c r=\"B1\"[^>]*>.*?</c>", Pattern.DOTALL);
+            Matcher b1m = b1Val.matcher(headerRow);
+            if (b1m.find()) {
+                // If t="s", it's a shared string index — try to read from sharedStrings
+                // For simplicity, just keep B1 as-is by preserving the whole header row
             }
-            // If no new value for this row, keep original (no replacement)
         }
-        m.appendTail(sb);
-        return sb.toString();
+
+        // Build new sheetData with inline strings
+        StringBuilder sd = new StringBuilder("<sheetData>");
+
+        // Row 1: header — preserve original header row exactly
+        if (hm.find(0)) {
+            sd.append(hm.group());
+        } else {
+            // Fallback: simple header
+            sd.append("<row r=\"1\" spans=\"1:2\">");
+            sd.append("<c r=\"A1\" t=\"inlineStr\"><is><t> </t></is></c>");
+            sd.append("<c r=\"B1\" t=\"inlineStr\"><is><t>").append(seriesName).append("</t></is></c>");
+            sd.append("</row>");
+        }
+
+        // Data rows: inline label + numeric value
+        for (int i = 0; i < rows.size(); i++) {
+            int rowNum = i + 2;
+            String label = rows.get(i).get("label") != null ? rows.get(i).get("label").toString() : "";
+            Object val = rows.get(i).get("value");
+            double numVal = val instanceof Number ? ((Number) val).doubleValue() : 0.0;
+
+            sd.append("<row r=\"").append(rowNum).append("\" spans=\"1:2\">");
+            sd.append("<c r=\"A").append(rowNum).append("\" t=\"inlineStr\">");
+            sd.append("<is><t>").append(escapeXml(label)).append("</t></is></c>");
+            sd.append("<c r=\"B").append(rowNum).append("\">");
+            sd.append("<v>").append(numVal).append("</v></c>");
+            sd.append("</row>");
+        }
+
+        sd.append("</sheetData>");
+
+        return (before + sd.toString() + after).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private byte[] updateTableRange(byte[] original, int dataRows) {
+        String xml = new String(original, java.nio.charset.StandardCharsets.UTF_8);
+        xml = xml.replaceFirst("ref=\"[^\"]+\"", "ref=\"A1:B" + (dataRows + 1) + "\"");
+        return xml.getBytes(java.nio.charset.StandardCharsets.UTF_8);
     }
 
     // ════════════════════════════════════════════════
@@ -196,66 +211,59 @@ public class ChartDataService {
         for (int ci = 0; ci < plotArea.sizeOfBarChartArray(); ci++) {
             CTBarSer[] series = plotArea.getBarChartArray(ci).getSerArray();
             for (int si = 0; si < series.length; si++) {
-                if (si == 0 && series[si].getCat() != null)
-                    updateCatCache(series[si].getCat(), rows);
-                if (series[si].getVal() != null)
-                    updateValCache(series[si].getVal(), rows, si == 0 ? "value" : "value2");
+                if (si == 0 && series[si].getCat() != null) updateCatCache(series[si].getCat(), rows);
+                if (series[si].getVal() != null) updateValCache(series[si].getVal(), rows, si == 0 ? "value" : "value2");
             }
         }
-
         for (int ci = 0; ci < plotArea.sizeOfLineChartArray(); ci++) {
-            CTLineSer[] s = plotArea.getLineChartArray(ci).getSerArray();
-            if (s.length > 0) {
-                if (s[0].getCat() != null) updateCatCache(s[0].getCat(), rows);
-                if (s[0].getVal() != null) updateValCache(s[0].getVal(), rows, "value");
+            CTLineSer[] series = plotArea.getLineChartArray(ci).getSerArray();
+            if (series.length > 0) {
+                if (series[0].getCat() != null) updateCatCache(series[0].getCat(), rows);
+                if (series[0].getVal() != null) updateValCache(series[0].getVal(), rows, "value");
             }
         }
-
         for (int ci = 0; ci < plotArea.sizeOfPieChartArray(); ci++) {
-            CTPieSer[] s = plotArea.getPieChartArray(ci).getSerArray();
-            if (s.length > 0) {
-                if (s[0].getCat() != null) updateCatCache(s[0].getCat(), rows);
-                if (s[0].getVal() != null) updateValCache(s[0].getVal(), rows, "value");
+            CTPieSer[] series = plotArea.getPieChartArray(ci).getSerArray();
+            if (series.length > 0) {
+                if (series[0].getCat() != null) updateCatCache(series[0].getCat(), rows);
+                if (series[0].getVal() != null) updateValCache(series[0].getVal(), rows, "value");
             }
         }
     }
 
     private void updateCatCache(CTAxDataSource cat, List<Map<String, Object>> rows) {
         try {
-            if (cat.getStrRef() == null) return;
-            CTStrRef ref = cat.getStrRef();
-            ref.setF("Sheet1!$A$2:$A$" + (rows.size() + 1));
-            CTStrData cache = ref.isSetStrCache() ? ref.getStrCache() : ref.addNewStrCache();
-            cache.setPtArray(new CTStrVal[0]);
-            cache.getPtCount().setVal(rows.size());
-            for (int i = 0; i < rows.size(); i++) {
-                CTStrVal pt = cache.addNewPt();
-                pt.setIdx(i);
-                Object lbl = rows.get(i).get("label");
-                pt.setV(lbl != null ? lbl.toString() : "");
+            if (cat.getStrRef() != null) {
+                CTStrRef ref = cat.getStrRef();
+                ref.setF("Sheet1!$A$2:$A$" + (rows.size() + 1));
+                CTStrData cache = ref.isSetStrCache() ? ref.getStrCache() : ref.addNewStrCache();
+                cache.setPtArray(new CTStrVal[0]);
+                cache.getPtCount().setVal(rows.size());
+                for (int i = 0; i < rows.size(); i++) {
+                    CTStrVal pt = cache.addNewPt();
+                    pt.setIdx(i);
+                    pt.setV(rows.get(i).get("label") != null ? rows.get(i).get("label").toString() : "");
+                }
             }
-        } catch (Exception e) {
-            log.debug("Cat cache skip: {}", e.getMessage());
-        }
+        } catch (Exception e) { log.debug("Cat cache skip: {}", e.getMessage()); }
     }
 
     private void updateValCache(CTNumDataSource val, List<Map<String, Object>> rows, String key) {
         try {
-            if (val.getNumRef() == null) return;
-            CTNumRef ref = val.getNumRef();
-            ref.setF("Sheet1!$B$2:$B$" + (rows.size() + 1));
-            CTNumData cache = ref.isSetNumCache() ? ref.getNumCache() : ref.addNewNumCache();
-            cache.setPtArray(new CTNumVal[0]);
-            cache.getPtCount().setVal(rows.size());
-            for (int i = 0; i < rows.size(); i++) {
-                CTNumVal pt = cache.addNewPt();
-                pt.setIdx(i);
-                Object v = rows.get(i).get(key);
-                pt.setV(v instanceof Number ? String.valueOf(((Number) v).doubleValue()) : "0");
+            if (val.getNumRef() != null) {
+                CTNumRef ref = val.getNumRef();
+                ref.setF("Sheet1!$B$2:$B$" + (rows.size() + 1));
+                CTNumData cache = ref.isSetNumCache() ? ref.getNumCache() : ref.addNewNumCache();
+                cache.setPtArray(new CTNumVal[0]);
+                cache.getPtCount().setVal(rows.size());
+                for (int i = 0; i < rows.size(); i++) {
+                    CTNumVal pt = cache.addNewPt();
+                    pt.setIdx(i);
+                    Object v = rows.get(i).get(key);
+                    pt.setV(v instanceof Number ? String.valueOf(((Number) v).doubleValue()) : "0");
+                }
             }
-        } catch (Exception e) {
-            log.debug("Val cache skip: {}", e.getMessage());
-        }
+        } catch (Exception e) { log.debug("Val cache skip: {}", e.getMessage()); }
     }
 
     // ════════════════════════════════════════════════
@@ -263,21 +271,16 @@ public class ChartDataService {
     // ════════════════════════════════════════════════
 
     private String extractAltText(XSLFShape shape) {
-        try {
-            Matcher m = ALT_TEXT_PAT.matcher(shape.getXmlObject().toString());
-            if (m.find()) return m.group(1);
-        } catch (Exception e) {}
+        try { Matcher m = ALT_TEXT_PAT.matcher(shape.getXmlObject().toString()); if (m.find()) return m.group(1); } catch (Exception e) {}
         return "";
     }
 
     private String extractChartRelId(XSLFShape shape) {
-        try {
-            String xml = shape.getXmlObject().toString();
-            if (xml.contains("chart")) {
-                Matcher m = REL_ID_PAT.matcher(xml);
-                if (m.find()) return m.group(1);
-            }
-        } catch (Exception e) {}
+        try { String x = shape.getXmlObject().toString(); if (x.contains("chart")) { Matcher m = REL_ID_PAT.matcher(x); if (m.find()) return m.group(1); } } catch (Exception e) {}
         return null;
+    }
+
+    private String escapeXml(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 }

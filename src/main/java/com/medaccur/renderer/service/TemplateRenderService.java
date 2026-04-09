@@ -2,6 +2,10 @@ package com.medaccur.renderer.service;
 
 import com.medaccur.renderer.model.RenderRequest;
 import com.medaccur.renderer.model.SlideSpec;
+import org.apache.poi.ooxml.POIXMLDocumentPart;
+import org.apache.poi.openxml4j.opc.PackagePart;
+import org.apache.poi.openxml4j.opc.PackageRelationship;
+import org.apache.poi.openxml4j.opc.TargetMode;
 import org.apache.poi.openxml4j.util.ZipSecureFile;
 import org.apache.poi.xslf.usermodel.*;
 import org.openxmlformats.schemas.presentationml.x2006.main.CTGroupShape;
@@ -16,18 +20,10 @@ import java.io.*;
 import java.util.*;
 
 /**
- * Core rendering service. Opens the master template, creates slides from
- * SlideLayouts, fills placeholders, updates charts, inserts figures.
+ * v3.6: Charts updated on layout → then ALL shapes (including charts)
+ * copied to slide with relationships → layout cleared.
  *
- * CRITICAL RULES (from 6 weeks of failures):
- * 1. NEVER modify template colors or themes
- * 2. NEVER programmatically create layouts
- * 3. ONLY replace text + insert images + update chart data
- * 4. Template is READ-ONLY — design changes only in PowerPoint
- *
- * KEY FIX (v3.1): pptx.createSlide(layout) creates an EMPTY slide.
- * Layout shapes (containing {{placeholders}}) are NOT copied to the slide.
- * We must import them via XML deep-copy BEFORE placeholder replacement.
+ * This makes charts editable on the slide (not locked in background).
  */
 @Service
 public class TemplateRenderService {
@@ -60,7 +56,6 @@ public class TemplateRenderService {
 
             masterTemplateBytes = masterTemplateResource.getInputStream().readAllBytes();
 
-            // Index all layout names
             try (XMLSlideShow pptx = new XMLSlideShow(new ByteArrayInputStream(masterTemplateBytes))) {
                 for (XSLFSlideMaster master : pptx.getSlideMasters()) {
                     for (XSLFSlideLayout layout : master.getSlideLayouts()) {
@@ -80,15 +75,6 @@ public class TemplateRenderService {
         }
     }
 
-    /**
-     * Render a complete deck from a RenderRequest.
-     *
-     * Strategy:
-     * PASS 1 — Create all slides from layouts and import layout shapes to slide level.
-     * CLEANUP — Clear shapes from used layouts (prevents visual duplication).
-     * PASS 2 — Replace placeholders, update charts, insert figures on each slide.
-     * FINAL  — Remove original template slides and write output.
-     */
     public byte[] renderDeck(RenderRequest request) throws Exception {
         if (masterTemplateBytes == null) {
             throw new IllegalStateException("Master template not loaded");
@@ -97,7 +83,6 @@ public class TemplateRenderService {
         XMLSlideShow pptx = new XMLSlideShow(new ByteArrayInputStream(masterTemplateBytes));
         int originalSlideCount = pptx.getSlides().size();
 
-        // ── PASS 1: Create slides and import layout shapes ──────────
         Set<XSLFSlideLayout> usedLayouts = new LinkedHashSet<>();
         List<XSLFSlide> newSlides = new ArrayList<>();
         List<SlideSpec> matchedSpecs = new ArrayList<>();
@@ -113,113 +98,100 @@ public class TemplateRenderService {
                 continue;
             }
 
-            // CHART FIX: Update embedded chart data on the LAYOUT BEFORE creating
-            // the slide. Charts live on the layout level — POI's API can find them
-            // there. The slide inherits the updated chart via visual inheritance.
+            // Step A: Update chart data on layout BEFORE creating slide
             if (spec.hasChartData()) {
                 chartDataService.updateAllCharts(layout, spec.getChartData());
             }
 
-            // Create slide from layout (inherits design + updated charts)
+            // Step B: Create slide from layout
             XSLFSlide slide = pptx.createSlide(layout);
 
-            // Copy text shapes from layout to slide level via XML
-            // (skip graphicFrame + pic — charts stay on layout for inheritance)
-            int imported = importLayoutShapesToSlide(slide, layout);
-            log.info("  {} shapes imported from layout to slide", imported);
+            // Step C: Copy ALL shapes from layout to slide (text + charts + images)
+            int imported = importAllShapes(slide, layout);
+            log.info("  {} shapes imported to slide", imported);
+
+            // Step D: Copy chart/image relationships from layout to slide
+            copyRelationships(layout, slide);
 
             usedLayouts.add(layout);
             newSlides.add(slide);
             matchedSpecs.add(spec);
         }
 
-        // ── CLEANUP: Clear shapes from used layouts (prevent double-rendering) ──
+        // Clear shapes from used layouts (prevent double-rendering)
         for (XSLFSlideLayout layout : usedLayouts) {
-            clearLayoutShapes(layout);
-            log.debug("  Cleared shapes from layout '{}'", layout.getName());
+            clearAllLayoutShapes(layout);
         }
 
-        // ── PASS 2: Fill content on each slide ─────────────────────
+        // Fill content on each slide
         for (int i = 0; i < newSlides.size(); i++) {
             XSLFSlide slide = newSlides.get(i);
             SlideSpec spec = matchedSpecs.get(i);
 
-            // Merge metadata + slide-specific content
             Map<String, String> merged = new HashMap<>();
             if (request.getMetadata() != null) merged.putAll(request.getMetadata());
             if (spec.getContent() != null) merged.putAll(spec.getContent());
 
-            // Step 1: Replace {{placeholders}}
             int replaced = placeholderService.replacePlaceholders(slide, merged);
             log.info("  Slide {}: {} placeholders replaced", i + 1, replaced);
 
-            // Step 2: Remove unfilled {{placeholders}}
-            int cleaned = placeholderService.removeUnfilledPlaceholders(slide);
-            if (cleaned > 0) log.info("  Slide {}: {} unfilled placeholders removed", i + 1, cleaned);
+            placeholderService.removeUnfilledPlaceholders(slide);
 
-            // Step 3: Insert figure PNGs (KM curves, Forest plots)
-            // (Charts already updated on layout in Pass 1)
             if (spec.hasFigure()) {
                 figureService.insertFigure(slide, spec.getFigurePng());
             }
 
-            // Step 5: Enable auto-shrink
             placeholderService.enableAutoShrink(slide);
         }
 
-        // ── FINAL: Remove original template slides ──────────────────
+        // Remove original template slides
         for (int i = originalSlideCount - 1; i >= 0; i--) {
             pptx.removeSlide(i);
         }
 
-        // Write output
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         pptx.write(out);
         pptx.close();
 
-        log.info("Deck rendered: {} slides, {} KB",
-                 newSlides.size(), out.size() / 1024);
+        log.info("Deck rendered: {} slides, {} KB", newSlides.size(), out.size() / 1024);
         return out.toByteArray();
     }
 
-    // ════════════════════════════════════════════════════════════
-    // LAYOUT → SLIDE SHAPE IMPORT (the critical fix)
-    // ════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════
+    // SHAPE IMPORT: ALL types including charts
+    // ════════════════════════════════════════════════
 
     /**
-     * Deep-copy text shapes from a layout's XML spTree to the slide's XML spTree.
-     *
-     * Copies: sp, grpSp, cxnSp (contain {{placeholders}} and decorative shapes)
-     * SKIPS: graphicFrame (charts stay on layout — updated there, inherited visually)
-     * SKIPS: pic (images stay on layout — inherited visually)
-     *
-     * @return number of shapes imported
+     * Copy ALL shapes from layout to slide via XML deep-copy.
+     * Includes sp, grpSp, cxnSp, graphicFrame (charts), pic (images).
      */
-    private int importLayoutShapesToSlide(XSLFSlide slide, XSLFSlideLayout layout) {
+    private int importAllShapes(XSLFSlide slide, XSLFSlideLayout layout) {
         int count = 0;
         try {
-            CTGroupShape layoutTree = layout.getXmlObject().getCSld().getSpTree();
-            CTGroupShape slideTree = slide.getXmlObject().getCSld().getSpTree();
+            CTGroupShape src = layout.getXmlObject().getCSld().getSpTree();
+            CTGroupShape dst = slide.getXmlObject().getCSld().getSpTree();
 
-            for (int i = 0; i < layoutTree.sizeOfSpArray(); i++) {
-                slideTree.addNewSp().set(layoutTree.getSpArray(i).copy());
+            for (int i = 0; i < src.sizeOfSpArray(); i++) {
+                dst.addNewSp().set(src.getSpArray(i).copy());
                 count++;
             }
-
-            for (int i = 0; i < layoutTree.sizeOfGrpSpArray(); i++) {
-                slideTree.addNewGrpSp().set(layoutTree.getGrpSpArray(i).copy());
+            for (int i = 0; i < src.sizeOfGrpSpArray(); i++) {
+                dst.addNewGrpSp().set(src.getGrpSpArray(i).copy());
                 count++;
             }
-
-            for (int i = 0; i < layoutTree.sizeOfCxnSpArray(); i++) {
-                slideTree.addNewCxnSp().set(layoutTree.getCxnSpArray(i).copy());
+            for (int i = 0; i < src.sizeOfCxnSpArray(); i++) {
+                dst.addNewCxnSp().set(src.getCxnSpArray(i).copy());
                 count++;
             }
-
-            // graphicFrame (charts) and pic (images) stay on layout:
-            // - Charts: updated on layout in Pass 1, inherited visually
-            // - Images: inherited visually from layout (no modification needed)
-
+            for (int i = 0; i < src.sizeOfGraphicFrameArray(); i++) {
+                dst.addNewGraphicFrame().set(src.getGraphicFrameArray(i).copy());
+                count++;
+                log.debug("  Copied graphicFrame (chart/table)");
+            }
+            for (int i = 0; i < src.sizeOfPicArray(); i++) {
+                dst.addNewPic().set(src.getPicArray(i).copy());
+                count++;
+            }
         } catch (Exception e) {
             log.error("Shape import failed: {}", e.getMessage(), e);
         }
@@ -227,36 +199,63 @@ public class TemplateRenderService {
     }
 
     /**
-     * Clear text shapes from a layout's spTree after they've been copied to slides.
-     * Keeps graphicFrame (charts) and pic (images) for visual inheritance.
-     *
-     * SAFE because we work on a FRESH COPY of the template per render.
+     * Copy OPC relationships from layout to slide.
+     * Charts reference r:id="rIdX" — these must resolve on the slide part.
      */
-    private void clearLayoutShapes(XSLFSlideLayout layout) {
+    private void copyRelationships(XSLFSlideLayout layout, XSLFSlide slide) {
         try {
-            CTGroupShape tree = layout.getXmlObject().getCSld().getSpTree();
+            PackagePart slidePart = slide.getPackagePart();
 
-            while (tree.sizeOfSpArray() > 0) tree.removeSp(0);
-            while (tree.sizeOfGrpSpArray() > 0) tree.removeGrpSp(0);
-            while (tree.sizeOfCxnSpArray() > 0) tree.removeCxnSp(0);
+            for (POIXMLDocumentPart.RelationPart rp : layout.getRelationParts()) {
+                PackageRelationship rel = rp.getRelationship();
+                String relId = rel.getId();
+                String relType = rel.getRelationshipType();
 
-            // KEEP graphicFrame (charts with updated data) and pic (images)
-            // They remain on the layout and are inherited visually by the slide.
+                // Only copy chart and image relationships
+                if (!relType.contains("chart") && !relType.contains("image")) continue;
 
+                // Check if slide already has this relId
+                boolean exists = false;
+                try {
+                    if (slidePart.getRelationship(relId) != null) exists = true;
+                } catch (Exception ignore) {}
+
+                if (!exists) {
+                    PackagePart targetPart = rp.getDocumentPart().getPackagePart();
+                    slidePart.addRelationship(
+                        targetPart.getPartName(),
+                        TargetMode.INTERNAL,
+                        relType,
+                        relId
+                    );
+                    log.debug("  Rel copied: {} → {}", relId, targetPart.getPartName());
+                }
+            }
         } catch (Exception e) {
-            log.error("Layout shape clear failed: {}", e.getMessage(), e);
+            log.warn("Relationship copy issue: {}", e.getMessage());
         }
     }
 
     /**
-     * Find a SlideLayout by name across all SlideMasters.
-     * Case-insensitive match.
+     * Clear ALL shapes from layout to prevent double-rendering.
      */
+    private void clearAllLayoutShapes(XSLFSlideLayout layout) {
+        try {
+            CTGroupShape tree = layout.getXmlObject().getCSld().getSpTree();
+            while (tree.sizeOfSpArray() > 0) tree.removeSp(0);
+            while (tree.sizeOfGrpSpArray() > 0) tree.removeGrpSp(0);
+            while (tree.sizeOfCxnSpArray() > 0) tree.removeCxnSp(0);
+            while (tree.sizeOfGraphicFrameArray() > 0) tree.removeGraphicFrame(0);
+            while (tree.sizeOfPicArray() > 0) tree.removePic(0);
+        } catch (Exception e) {
+            log.error("Layout clear failed: {}", e.getMessage(), e);
+        }
+    }
+
     private XSLFSlideLayout findLayout(XMLSlideShow pptx, String layoutName) {
         for (XSLFSlideMaster master : pptx.getSlideMasters()) {
             for (XSLFSlideLayout layout : master.getSlideLayouts()) {
-                if (layout.getName() != null &&
-                    layout.getName().equalsIgnoreCase(layoutName)) {
+                if (layout.getName() != null && layout.getName().equalsIgnoreCase(layoutName)) {
                     return layout;
                 }
             }
@@ -264,15 +263,7 @@ public class TemplateRenderService {
         return null;
     }
 
-    public boolean isTemplateLoaded() {
-        return masterTemplateBytes != null;
-    }
-
-    public int getLayoutCount() {
-        return availableLayouts.size();
-    }
-
-    public List<String> getAvailableLayouts() {
-        return Collections.unmodifiableList(availableLayouts);
-    }
+    public boolean isTemplateLoaded() { return masterTemplateBytes != null; }
+    public int getLayoutCount() { return availableLayouts.size(); }
+    public List<String> getAvailableLayouts() { return Collections.unmodifiableList(availableLayouts); }
 }
