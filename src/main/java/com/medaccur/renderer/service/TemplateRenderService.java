@@ -2,6 +2,9 @@ package com.medaccur.renderer.service;
 
 import com.medaccur.renderer.model.RenderRequest;
 import com.medaccur.renderer.model.SlideSpec;
+import org.apache.poi.ooxml.POIXMLDocumentPart;
+import org.apache.poi.openxml4j.opc.PackageRelationship;
+import org.apache.poi.openxml4j.opc.TargetMode;
 import org.apache.poi.openxml4j.util.ZipSecureFile;
 import org.apache.poi.xslf.usermodel.*;
 import org.openxmlformats.schemas.presentationml.x2006.main.CTGroupShape;
@@ -188,17 +191,18 @@ public class TemplateRenderService {
      * When Apache POI creates a slide via createSlide(layout), the slide is EMPTY.
      * Layout shapes are only "inherited" visually — they're not on the slide and
      * therefore NOT accessible via slide.getShapes(). This means PlaceholderService
-     * can never find or replace {{placeholders}}.
+     * can never find or replace {{placeholders}}, and ChartDataService can never
+     * find embedded charts to update their Excel data.
      *
-     * This method copies:
-     * - sp  (TextBoxes, AutoShapes — contain {{placeholders}})
-     * - grpSp (Group shapes — may contain nested text)
-     * - cxnSp (Connectors)
+     * This method copies ALL shape types:
+     * - sp       (TextBoxes, AutoShapes — contain {{placeholders}})
+     * - grpSp    (Group shapes — may contain nested text)
+     * - cxnSp    (Connectors)
+     * - graphicFrame (Embedded Excel charts — need relationship copy!)
+     * - pic      (Embedded images — need relationship copy!)
      *
-     * We SKIP pic and graphicFrame because they reference relationships
-     * (images, charts) that are bound to the layout part, not the slide part.
-     * Images on layouts remain as inherited visual elements.
-     * Charts are handled by ChartDataService via a separate mechanism.
+     * For graphicFrame and pic, we also copy the OPC relationships from the
+     * layout part to the slide part so that chart/image references resolve.
      *
      * @return number of shapes imported
      */
@@ -226,15 +230,62 @@ public class TemplateRenderService {
                 count++;
             }
 
-            // NOTE: We intentionally SKIP:
-            // - pic (pictures) — relationship IDs won't resolve on slide
-            // - graphicFrame (charts, tables) — chart parts are bound to layout
-            // These remain as inherited layout elements and are handled separately.
+            // Copy graphicFrame elements (embedded Excel charts, tables)
+            for (int i = 0; i < layoutTree.sizeOfGraphicFrameArray(); i++) {
+                slideTree.addNewGraphicFrame().set(layoutTree.getGraphicFrameArray(i).copy());
+                count++;
+            }
+
+            // Copy pic elements (embedded images, logos)
+            for (int i = 0; i < layoutTree.sizeOfPicArray(); i++) {
+                slideTree.addNewPic().set(layoutTree.getPicArray(i).copy());
+                count++;
+            }
+
+            // Copy ALL relationships from layout to slide (charts, images, etc.)
+            // GraphicFrame/pic XML contains r:id="rIdX" references that must resolve
+            // on the slide part, not just the layout part.
+            copyRelationships(layout, slide);
 
         } catch (Exception e) {
             log.error("Shape import failed: {}", e.getMessage(), e);
         }
         return count;
+    }
+
+    /**
+     * Copy OPC package relationships from layout to slide.
+     * This ensures that r:id references in copied graphicFrame/pic XML
+     * resolve correctly on the slide part.
+     *
+     * Copies: chart relations, image relations, and any other embedded parts.
+     */
+    private void copyRelationships(XSLFSlideLayout layout, XSLFSlide slide) {
+        try {
+            for (POIXMLDocumentPart.RelationPart rp : layout.getRelationParts()) {
+                POIXMLDocumentPart part = rp.getDocumentPart();
+                PackageRelationship rel = rp.getRelationship();
+                String relId = rel.getId();
+
+                // Skip if this relationship already exists on the slide
+                try {
+                    if (slide.getPackagePart().getRelationship(relId) != null) continue;
+                } catch (Exception ignore) {}
+
+                // Copy the relationship: same ID, same target, same type
+                slide.getPackagePart().addRelationship(
+                    part.getPackagePart().getPartName(),
+                    TargetMode.INTERNAL,
+                    rel.getRelationshipType(),
+                    relId
+                );
+                log.debug("  Copied relationship {} → {} ({})",
+                    relId, part.getPackagePart().getPartName(), 
+                    part.getClass().getSimpleName());
+            }
+        } catch (Exception e) {
+            log.warn("Relationship copy partial failure: {}", e.getMessage());
+        }
     }
 
     /**
@@ -251,8 +302,8 @@ public class TemplateRenderService {
             while (tree.sizeOfSpArray() > 0) tree.removeSp(0);
             while (tree.sizeOfGrpSpArray() > 0) tree.removeGrpSp(0);
             while (tree.sizeOfCxnSpArray() > 0) tree.removeCxnSp(0);
-
-            // Keep pic and graphicFrame (images, chart relations stay on layout)
+            while (tree.sizeOfGraphicFrameArray() > 0) tree.removeGraphicFrame(0);
+            while (tree.sizeOfPicArray() > 0) tree.removePic(0);
 
         } catch (Exception e) {
             log.error("Layout shape clear failed: {}", e.getMessage(), e);
