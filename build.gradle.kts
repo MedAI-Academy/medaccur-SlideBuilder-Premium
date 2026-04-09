@@ -21,12 +21,11 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.springframework.boot:spring-boot-starter-actuator")
 
-    // Apache POI — MUST use poi-ooxml-full for CT* schema classes
-    implementation("org.apache.poi:poi:5.4.0")
-    implementation("org.apache.poi:poi-ooxml-full:5.4.0") {
-        // Exclude lite — full includes everything
-        exclude(group = "org.apache.poi", module = "poi-ooxml-lite")
-    }
+    // Apache POI 5.3.0 — all three are needed:
+    // poi = core, poi-ooxml = XSLF/XSSF classes, poi-ooxml-full = CT* schema beans
+    implementation("org.apache.poi:poi:5.3.0")
+    implementation("org.apache.poi:poi-ooxml:5.3.0")
+    implementation("org.apache.poi:poi-ooxml-full:5.3.0")
 
     // JSON
     implementation("com.fasterxml.jackson.core:jackson-databind")
@@ -45,7 +44,6 @@ tasks.withType<Test> {
     useJUnitPlatform()
 }
 
-// Increase max memory for large PPTX processing
 tasks.withType<JavaExec> {
     jvmArgs = listOf("-Xmx512m")
 }
