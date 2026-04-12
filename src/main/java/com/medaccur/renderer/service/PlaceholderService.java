@@ -37,6 +37,36 @@ public class PlaceholderService {
                         count += replaceInTextShape((XSLFTextShape) child, content);
                     }
                 }
+            } else if (shape instanceof XSLFTable) {
+                // BUG 1 FIX: scan table cells for {{placeholders}}
+                count += replaceInTable((XSLFTable) shape, content);
+            }
+        }
+        return count;
+    }
+
+    private int replaceInTable(XSLFTable table, Map<String, String> content) {
+        int count = 0;
+        for (XSLFTableRow row : table.getRows()) {
+            for (XSLFTableCell cell : row.getCells()) {
+                for (XSLFTextParagraph para : cell.getTextParagraphs()) {
+                    String fullText = para.getText();
+                    if (fullText == null || !fullText.contains("{{")) continue;
+
+                    String newText = fullText;
+                    for (Map.Entry<String, String> e : content.entrySet()) {
+                        String placeholder = "{{" + e.getKey() + "}}";
+                        if (newText.contains(placeholder)) {
+                            String value = e.getValue() != null ? e.getValue() : "";
+                            newText = newText.replace(placeholder, value);
+                            count++;
+                        }
+                    }
+
+                    if (!newText.equals(fullText)) {
+                        applyTextToRuns(para, newText);
+                    }
+                }
             }
         }
         return count;
@@ -78,6 +108,28 @@ public class PlaceholderService {
                 for (XSLFShape child : ((XSLFGroupShape) shape).getShapes()) {
                     if (child instanceof XSLFTextShape) {
                         count += removeUnfilledInTextShape((XSLFTextShape) child);
+                    }
+                }
+            } else if (shape instanceof XSLFTable) {
+                // BUG 1 FIX: also clean unfilled {{}} in table cells
+                count += removeUnfilledInTable((XSLFTable) shape);
+            }
+        }
+        return count;
+    }
+
+    private int removeUnfilledInTable(XSLFTable table) {
+        int count = 0;
+        for (XSLFTableRow row : table.getRows()) {
+            for (XSLFTableCell cell : row.getCells()) {
+                for (XSLFTextParagraph para : cell.getTextParagraphs()) {
+                    String text = para.getText();
+                    if (text == null || !text.contains("{{")) continue;
+
+                    String cleaned = PLACEHOLDER.matcher(text).replaceAll("");
+                    if (!cleaned.equals(text)) {
+                        applyTextToRuns(para, cleaned.trim());
+                        count++;
                     }
                 }
             }
