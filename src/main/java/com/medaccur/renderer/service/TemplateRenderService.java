@@ -20,10 +20,10 @@ import java.io.*;
 import java.util.*;
 
 /**
- * v3.6: Charts updated on layout → then ALL shapes (including charts)
- * copied to slide with relationships → layout cleared.
+ * v3.7: Added ForestPlotShapeService for native forest plot rendering.
  *
- * This makes charts editable on the slide (not locked in background).
+ * Charts updated on layout -> then ALL shapes (including charts)
+ * copied to slide with relationships -> layout cleared.
  */
 @Service
 public class TemplateRenderService {
@@ -36,16 +36,19 @@ public class TemplateRenderService {
     private final PlaceholderService placeholderService;
     private final FigureService figureService;
     private final ChartDataService chartDataService;
+    private final ForestPlotShapeService forestPlotShapeService;  // NEW
 
     private byte[] masterTemplateBytes;
     private List<String> availableLayouts = new ArrayList<>();
 
     public TemplateRenderService(PlaceholderService placeholderService,
                                   FigureService figureService,
-                                  ChartDataService chartDataService) {
+                                  ChartDataService chartDataService,
+                                  ForestPlotShapeService forestPlotShapeService) {  // NEW
         this.placeholderService = placeholderService;
         this.figureService = figureService;
         this.chartDataService = chartDataService;
+        this.forestPlotShapeService = forestPlotShapeService;  // NEW
     }
 
     @PostConstruct
@@ -94,7 +97,7 @@ public class TemplateRenderService {
 
             XSLFSlideLayout layout = findLayout(pptx, layoutName);
             if (layout == null) {
-                log.warn("  Layout '{}' not found — skipping", layoutName);
+                log.warn("  Layout '{}' not found -- skipping", layoutName);
                 continue;
             }
 
@@ -141,6 +144,12 @@ public class TemplateRenderService {
                 figureService.insertFigure(slide, spec.getFigurePng());
             }
 
+            // NEW: Draw native forest plot shapes
+            if (spec.hasForestPlot()) {
+                forestPlotShapeService.addForestPlot(slide, spec.getForestPlotPoints());
+                log.info("  Slide {}: forest plot shapes drawn", i + 1);
+            }
+
             placeholderService.enableAutoShrink(slide);
         }
 
@@ -161,10 +170,6 @@ public class TemplateRenderService {
     // SHAPE IMPORT: ALL types including charts
     // ════════════════════════════════════════════════
 
-    /**
-     * Copy ALL shapes from layout to slide via XML deep-copy.
-     * Includes sp, grpSp, cxnSp, graphicFrame (charts), pic (images).
-     */
     private int importAllShapes(XSLFSlide slide, XSLFSlideLayout layout) {
         int count = 0;
         try {
@@ -198,10 +203,6 @@ public class TemplateRenderService {
         return count;
     }
 
-    /**
-     * Copy OPC relationships from layout to slide.
-     * Charts reference r:id="rIdX" — these must resolve on the slide part.
-     */
     private void copyRelationships(XSLFSlideLayout layout, XSLFSlide slide) {
         try {
             PackagePart slidePart = slide.getPackagePart();
@@ -211,10 +212,8 @@ public class TemplateRenderService {
                 String relId = rel.getId();
                 String relType = rel.getRelationshipType();
 
-                // Only copy chart and image relationships
                 if (!relType.contains("chart") && !relType.contains("image")) continue;
 
-                // Check if slide already has this relId
                 boolean exists = false;
                 try {
                     if (slidePart.getRelationship(relId) != null) exists = true;
@@ -228,7 +227,7 @@ public class TemplateRenderService {
                         relType,
                         relId
                     );
-                    log.debug("  Rel copied: {} → {}", relId, targetPart.getPartName());
+                    log.debug("  Rel copied: {} -> {}", relId, targetPart.getPartName());
                 }
             }
         } catch (Exception e) {
@@ -236,9 +235,6 @@ public class TemplateRenderService {
         }
     }
 
-    /**
-     * Clear ALL shapes from layout to prevent double-rendering.
-     */
     private void clearAllLayoutShapes(XSLFSlideLayout layout) {
         try {
             CTGroupShape tree = layout.getXmlObject().getCSld().getSpTree();
